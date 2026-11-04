@@ -9,7 +9,7 @@ upstream; nothing in this fork is Prisma-only code.
 
 | Ref | What it is |
 |---|---|
-| `main` | upstream `main` plus exactly one commit: this file and `fork/sync.sh` |
+| `main` | upstream `main` plus the fork's docs commits: this file and `fork/sync.sh` |
 | `streams` | `main` plus the patches below, one commit per patch, each naming its upstream PR or issue |
 | `streams-YYYYMMDD-<sha>` tags | every `streams` revision Streams has pinned (Streams' `Cargo.toml` pins one of these revs) |
 
@@ -28,6 +28,16 @@ issues that link to the commit on `streams`. Existing PRs stay open and link her
 | 6 | An explicit WAL flush writes only the WALs frozen by its call | issue [#2215](https://github.com/slatedb/slatedb/issues/2215) (PR creation is limited to collaborators) | Since #2084 `flush()` freezes the current WAL and the flush task froze it again, so a write appended in between cost its own WAL object. Streams' group-commit pump measured 21-24 WAL PUTs per 20 flushes under CPU load (exactly 20 on v0.15). |
 
 Merged upstream and therefore no longer carried: [#2193](https://github.com/slatedb/slatedb/pull/2193) (zstd 0.14), [#2208](https://github.com/slatedb/slatedb/pull/2208) (flush retention boundary), [#1964](https://github.com/slatedb/slatedb/pull/1964) (yield points).
+
+## Known issues (not patched)
+
+Behaviour Streams works around rather than patches. Upstream issues cannot be opened from this fork
+(issues are disabled here); each entry names the Streams test that reproduces it, so a pin that
+changes the behaviour shows up as that test failing.
+
+| # | Issue | Reproduced by | Streams' workaround |
+|---|---|---|---|
+| K1 | `create_checkpoint(CheckpointScope::All)` taken while writes are still buffered in the WAL writer leaves a data WAL above the checkpoint's replay point, so every projected (or union) clone of that checkpoint is refused (`InvalidCloneSourceWithWal`) until newer writes are flushed through a memtable. `begin_batch_writer_flush(true)` issues the WAL flush, then freezes the memtable stamped with `wal_observer.status().last_flushed_wal_id` from before that flush completes; the buffered writes land in the next WAL file while the memtable that holds them goes to L0. Openers are unaffected (replay skips entries at or below `last_committed_seq`), so this is checkpoint coverage, not durability. A later memtable flush plus a `Durable` checkpoint does not help (the memtable is empty). | Streams `keyspace::projection_tests::a_checkpoint_of_everything_with_wal_writes_buffered_is_refused_for_projection` (`src/keyspace_projection_tests.rs`): writes left buffered (no background flush, default write options), `checkpoint(All)`, a projected clone is refused; with `flush()` first, the same clone succeeds. | Streams' split and merge call `flush()` (a WAL flush) immediately before `create_checkpoint(All)` (S4-DESIGN rev 2.1 §1, §6.2). A fix would stamp the frozen memtable after the WAL flush `begin_batch_writer_flush(true)` issues completes. |
 
 ## Bringing in upstream changes
 
