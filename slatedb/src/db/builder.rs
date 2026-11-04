@@ -2212,6 +2212,11 @@ pub struct CloneBuilder<R: RangeBounds<Bytes> + Clone = (Bound<Bytes>, Bound<Byt
     projection_range: Option<R>,
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
+    seed: Option<Vec<(Bytes, Bytes)>>,
+    seed_block_size: Option<SstBlockSize>,
+    seed_compression_codec: Option<crate::config::CompressionCodec>,
+    seed_filter_policies: Vec<Arc<dyn FilterPolicy>>,
+    seed_block_transformer: Option<Arc<dyn BlockTransformer>>,
 }
 
 impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
@@ -2231,7 +2236,56 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
             projection_range: None,
             segment_filter: None,
             segment_projection: None,
+            seed: None,
+            seed_block_size: None,
+            seed_compression_codec: None,
+            seed_filter_policies: default_filter_policies(),
+            seed_block_transformer: None,
         }
+    }
+
+    /// Rows the clone holds as its own L0 table from the moment it is
+    /// initialized, one per key, written before the clone's manifest is
+    /// marked initialized: the seed is atomic with initialization, and the
+    /// clone need not be opened to write it. The rows' sequence numbers are
+    /// above every table the clone inherits, so for a key that an inherited
+    /// table also holds (outside a projection or not), the seed's value is
+    /// the one read. Not combined with a segment filter or projection. The
+    /// table is written in the format the `with_initial_*` options give (the
+    /// same options the clone's opener sets on its `DbBuilder`).
+    pub fn with_initial_rows(mut self, rows: Vec<(Bytes, Bytes)>) -> Self {
+        self.seed = Some(rows);
+        self
+    }
+
+    /// The seed table's block size (as `DbBuilder::with_sst_block_size`).
+    pub fn with_initial_sst_block_size(mut self, block_size: SstBlockSize) -> Self {
+        self.seed_block_size = Some(block_size);
+        self
+    }
+
+    /// The seed table's compression (as `Settings::compression_codec`).
+    pub fn with_initial_compression_codec(
+        mut self,
+        codec: Option<crate::config::CompressionCodec>,
+    ) -> Self {
+        self.seed_compression_codec = codec;
+        self
+    }
+
+    /// The seed table's filter policies (as `DbBuilder::with_filter_policies`).
+    pub fn with_initial_filter_policies(mut self, policies: Vec<Arc<dyn FilterPolicy>>) -> Self {
+        self.seed_filter_policies = policies;
+        self
+    }
+
+    /// The seed table's block transformer (as `DbBuilder::with_block_transformer`).
+    pub fn with_initial_block_transformer(
+        mut self,
+        transformer: Arc<dyn BlockTransformer>,
+    ) -> Self {
+        self.seed_block_transformer = Some(transformer);
+        self
     }
 
     pub fn with_clone_path(mut self, clone_path: Path) -> Self {
@@ -2322,7 +2376,17 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
                 fp_registry.clone(),
             ))
         };
-        crate::clone::create_clone(
+        let seed = self.seed.map(|rows| crate::clone::CloneSeed {
+            rows,
+            sst_format: SsTableFormat {
+                filter_policies: self.seed_filter_policies,
+                compression_codec: self.seed_compression_codec,
+                block_size: self.seed_block_size.unwrap_or_default().as_bytes(),
+                block_transformer: self.seed_block_transformer,
+                ..SsTableFormat::default()
+            },
+        });
+        crate::clone::create_clone_seeded(
             self.sources,
             self.clone_path,
             self.object_store,
@@ -2334,6 +2398,7 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
             self.projection_range,
             self.segment_filter,
             self.segment_projection,
+            seed,
         )
         .await
         .map_err(crate::Error::from)
