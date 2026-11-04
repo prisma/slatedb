@@ -21,6 +21,7 @@ use object_store::path::Path;
 use object_store::ObjectStore;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::DbRand;
+use std::collections::HashMap;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::Duration;
@@ -227,6 +228,7 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
     wal_admin: &dyn WalAdmin,
 ) -> Result<CreateCloneManifestResult, SlateDBError> {
     let clone_manifest_store = Arc::new(ManifestStore::new(&clone_path, object_store.clone()));
+    let mut loaded: HashMap<String, StoredManifest> = HashMap::new();
 
     let (clone_manifest, copy_wal_params) =
         match StoredManifest::try_load(clone_manifest_store.clone(), system_clock.clone()).await? {
@@ -288,6 +290,7 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                     &projection_range,
                     segment_filter.as_ref(),
                     segment_projection.as_ref(),
+                    &mut loaded,
                 )
                 .await?;
                 let copy_wal_params = match &sources[..] {
@@ -356,8 +359,12 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                 ))
             });
 
-        let mut external_db_manifest =
-            load_initialized_manifest(external_db_manifest_store, system_clock.clone()).await?;
+        let mut external_db_manifest = match loaded.remove(&external_db.path) {
+            Some(manifest) => manifest,
+            None => {
+                load_initialized_manifest(external_db_manifest_store, system_clock.clone()).await?
+            }
+        };
 
         if external_db_manifest
             .db_state()
@@ -413,6 +420,7 @@ async fn build_sources<R: RangeBounds<Bytes> + Clone>(
     projection_range: &Option<R>,
     segment_filter: Option<&SegmentFilterFn>,
     segment_projection: Option<&SegmentProjectionFn>,
+    loaded: &mut HashMap<String, StoredManifest>,
 ) -> Result<Vec<CloneSource>, SlateDBError> {
     let mut result: Vec<CloneSource> = vec![];
     for source in source_specs {
@@ -426,6 +434,7 @@ async fn build_sources<R: RangeBounds<Bytes> + Clone>(
                 projection_range,
                 segment_filter,
                 segment_projection,
+                Some(&mut *loaded),
             )
             .await?,
         );
@@ -442,6 +451,7 @@ async fn build_source<R: RangeBounds<Bytes> + Clone>(
     projection_range: &Option<R>,
     segment_filter: Option<&SegmentFilterFn>,
     segment_projection: Option<&SegmentProjectionFn>,
+    loaded: Option<&mut HashMap<String, StoredManifest>>,
 ) -> Result<CloneSource, SlateDBError> {
     let manifest_store = Arc::new(ManifestStore::new(&source.path, object_store.clone()));
     let mut latest_manifest =
@@ -468,6 +478,13 @@ async fn build_source<R: RangeBounds<Bytes> + Clone>(
         Manifest::projected(&manifest_at_checkpoint, &config, rand)?
     };
 
+    // The source's manifest as this call left it (with the checkpoint it
+    // created, if any), for the clone's final-checkpoint write on the same
+    // source: one load instead of two. A stale copy only costs that write
+    // a conflict and a refresh.
+    if let Some(loaded) = loaded {
+        loaded.insert(source.path.to_string(), latest_manifest);
+    }
     Ok(CloneSource {
         path: source.path.clone(),
         manifest: manifest_at_checkpoint,
@@ -523,6 +540,7 @@ async fn rebuild_source<R: RangeBounds<Bytes> + Clone>(
         projection_range,
         segment_filter,
         segment_projection,
+        None,
     )
     .await
 }
