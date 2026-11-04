@@ -2,11 +2,17 @@ use crate::bytes_range::BytesRange;
 use crate::checkpoint::Checkpoint;
 use crate::config::CheckpointOptions;
 
+use crate::block_cache_policy::BlockCachePolicy;
 use crate::db::builder::CloneSourceSpec;
+use crate::db_state::{SsTableId, SsTableView};
 use crate::error::SlateDBError;
 use crate::error::SlateDBError::CheckpointMissing;
+use crate::format::sst::SsTableFormat;
 use crate::manifest::store::{ManifestStore, StoredManifest};
-use crate::manifest::{Manifest, ProjectionConfig, VersionedManifest};
+use crate::manifest::{Manifest, ManifestCore, ProjectionConfig, VersionedManifest};
+use crate::object_store_tag::TableStoreKind;
+use crate::tablestore::TableStore;
+use crate::types::{RowEntry, ValueDeletable};
 use crate::utils::IdGenerator;
 use crate::wal::WalAdmin;
 use bytes::Bytes;
@@ -15,6 +21,7 @@ use object_store::path::Path;
 use object_store::ObjectStore;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::DbRand;
+use std::collections::HashMap;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +50,8 @@ struct CreateCloneManifestResult {
     copy_wal_params: Option<CopyWalParams>,
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
     clone_sources: Vec<CloneSourceSpec<R>>,
     clone_path: P,
@@ -55,7 +64,52 @@ pub(crate) async fn create_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
 ) -> Result<(), SlateDBError> {
+    create_clone_seeded(
+        clone_sources,
+        clone_path,
+        object_store,
+        wal_admin,
+        fp_registry,
+        system_clock,
+        rand,
+        projection_range,
+        segment_filter,
+        segment_projection,
+        None,
+    )
+    .await
+}
+
+/// Rows a clone holds as its own L0 table from the moment it is initialized
+/// (`CloneBuilder::with_initial_rows`), written in the format its opener reads.
+pub(crate) struct CloneSeed {
+    pub(crate) rows: Vec<(Bytes, Bytes)>,
+    pub(crate) sst_format: SsTableFormat,
+}
+
+/// `create_clone`, and before the clone is initialized, `seed`'s rows written
+/// as one SST under the clone's path and put at the front of its L0. The seed
+/// is atomic with initialization: a clone that is not yet initialized cannot
+/// be opened, and a resumed clone writes its seed again (an SST orphaned by
+/// the first attempt is unreferenced, for the garbage collector).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_clone_seeded<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
+    clone_sources: Vec<CloneSourceSpec<R>>,
+    clone_path: P,
+    object_store: Arc<dyn ObjectStore>,
+    wal_admin: Arc<dyn WalAdmin>,
+    fp_registry: Arc<FailPointRegistry>,
+    system_clock: Arc<dyn SystemClock>,
+    rand: Arc<DbRand>,
+    projection_range: Option<R>,
+    segment_filter: Option<SegmentFilterFn>,
+    segment_projection: Option<SegmentProjectionFn>,
+    seed: Option<CloneSeed>,
+) -> Result<(), SlateDBError> {
     let clone_path = clone_path.into();
+    if seed.is_some() && (segment_filter.is_some() || segment_projection.is_some()) {
+        return Err(SlateDBError::InvalidConfiguration("a clone seed is written to the unsegmented tree; it cannot be combined with a segment filter or projection".into()));
+    }
 
     validate_clone_source_specs(&clone_sources, &clone_path)?;
 
@@ -65,9 +119,9 @@ pub(crate) async fn create_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
     } = create_clone_manifest(
         clone_path.clone(),
         clone_sources,
-        object_store,
+        object_store.clone(),
         system_clock.clone(),
-        rand,
+        rand.clone(),
         fp_registry.clone(),
         projection_range,
         segment_filter,
@@ -86,12 +140,78 @@ pub(crate) async fn create_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
             .ok_or(SlateDBError::InvalidDBState)?;
 
         let mut dirty = clone_manifest.prepare_dirty()?;
+        if let Some(seed) = seed {
+            write_seed(
+                seed,
+                &object_store,
+                &clone_path,
+                &rand,
+                &system_clock,
+                &mut dirty.value.core,
+            )
+            .await?;
+        }
         dirty.value.core.replay_after_wal_id = replay_after_wal_id;
         dirty.value.core.next_wal_sst_id = next_wal_sst_id;
         dirty.value.core.initialized = true;
         clone_manifest.update(dirty).await?;
     }
 
+    Ok(())
+}
+
+/// Write `seed`'s rows, sorted by key, as one SST under `clone_path`, with
+/// sequence numbers above every table the clone inherits, and put it at the
+/// front of `core`'s L0. An empty seed writes nothing.
+async fn write_seed(
+    seed: CloneSeed,
+    object_store: &Arc<dyn ObjectStore>,
+    clone_path: &Path,
+    rand: &Arc<DbRand>,
+    system_clock: &Arc<dyn SystemClock>,
+    core: &mut ManifestCore,
+) -> Result<(), SlateDBError> {
+    let CloneSeed {
+        mut rows,
+        sst_format,
+    } = seed;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    if rows.windows(2).any(|w| w[0].0 == w[1].0) {
+        return Err(SlateDBError::InvalidConfiguration(
+            "a clone seed holds one row per key".into(),
+        ));
+    }
+    let table_store = Arc::new(TableStore::new(
+        object_store.clone(),
+        sst_format,
+        clone_path.clone(),
+        None,
+        TableStoreKind::Main,
+        BlockCachePolicy::default(),
+    ));
+    let id = SsTableId::from(rand.rng().gen_ulid(system_clock.as_ref()));
+    let mut writer = table_store.table_writer(id, None);
+    let mut seq = core.last_l0_seq;
+    for (key, value) in rows {
+        seq += 1;
+        writer
+            .add(RowEntry::new(
+                key,
+                ValueDeletable::Value(value),
+                seq,
+                None,
+                None,
+            ))
+            .await?;
+    }
+    let (handle, _) = writer.close().await?;
+    Arc::make_mut(&mut core.tree)
+        .l0
+        .push_front(SsTableView::identity(handle));
+    core.last_l0_seq = seq;
     Ok(())
 }
 
@@ -108,6 +228,7 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
     wal_admin: &dyn WalAdmin,
 ) -> Result<CreateCloneManifestResult, SlateDBError> {
     let clone_manifest_store = Arc::new(ManifestStore::new(&clone_path, object_store.clone()));
+    let mut loaded: HashMap<String, StoredManifest> = HashMap::new();
 
     let (clone_manifest, copy_wal_params) =
         match StoredManifest::try_load(clone_manifest_store.clone(), system_clock.clone()).await? {
@@ -169,6 +290,7 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                     &projection_range,
                     segment_filter.as_ref(),
                     segment_projection.as_ref(),
+                    &mut loaded,
                 )
                 .await?;
                 let copy_wal_params = match &sources[..] {
@@ -237,8 +359,12 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                 ))
             });
 
-        let mut external_db_manifest =
-            load_initialized_manifest(external_db_manifest_store, system_clock.clone()).await?;
+        let mut external_db_manifest = match loaded.remove(&external_db.path) {
+            Some(manifest) => manifest,
+            None => {
+                load_initialized_manifest(external_db_manifest_store, system_clock.clone()).await?
+            }
+        };
 
         if external_db_manifest
             .db_state()
@@ -294,6 +420,7 @@ async fn build_sources<R: RangeBounds<Bytes> + Clone>(
     projection_range: &Option<R>,
     segment_filter: Option<&SegmentFilterFn>,
     segment_projection: Option<&SegmentProjectionFn>,
+    loaded: &mut HashMap<String, StoredManifest>,
 ) -> Result<Vec<CloneSource>, SlateDBError> {
     let mut result: Vec<CloneSource> = vec![];
     for source in source_specs {
@@ -307,6 +434,7 @@ async fn build_sources<R: RangeBounds<Bytes> + Clone>(
                 projection_range,
                 segment_filter,
                 segment_projection,
+                Some(&mut *loaded),
             )
             .await?,
         );
@@ -323,6 +451,7 @@ async fn build_source<R: RangeBounds<Bytes> + Clone>(
     projection_range: &Option<R>,
     segment_filter: Option<&SegmentFilterFn>,
     segment_projection: Option<&SegmentProjectionFn>,
+    loaded: Option<&mut HashMap<String, StoredManifest>>,
 ) -> Result<CloneSource, SlateDBError> {
     let manifest_store = Arc::new(ManifestStore::new(&source.path, object_store.clone()));
     let mut latest_manifest =
@@ -349,6 +478,13 @@ async fn build_source<R: RangeBounds<Bytes> + Clone>(
         Manifest::projected(&manifest_at_checkpoint, &config, rand)?
     };
 
+    // The source's manifest as this call left it (with the checkpoint it
+    // created, if any), for the clone's final-checkpoint write on the same
+    // source: one load instead of two. A stale copy only costs that write
+    // a conflict and a refresh.
+    if let Some(loaded) = loaded {
+        loaded.insert(source.path.to_string(), latest_manifest);
+    }
     Ok(CloneSource {
         path: source.path.clone(),
         manifest: manifest_at_checkpoint,
@@ -404,6 +540,7 @@ async fn rebuild_source<R: RangeBounds<Bytes> + Clone>(
         projection_range,
         segment_filter,
         segment_projection,
+        None,
     )
     .await
 }
@@ -3084,5 +3221,262 @@ mod tests {
             ),
             "expected NotFound for the missing WAL object, got {err:?}"
         );
+    }
+
+    /// Every row of `db`, in key order.
+    async fn all_rows(db: &Db) -> Vec<(Bytes, Bytes)> {
+        let mut iter = db.scan(..).await.unwrap();
+        let mut out = Vec::new();
+        while let Some(kv) = iter.next().await.unwrap() {
+            out.push((kv.key, kv.value));
+        }
+        out
+    }
+
+    /// A parent with `rows` put, flushed into L0 and closed, so no data WAL
+    /// remains and a projected clone of it is allowed.
+    async fn flushed_parent(
+        object_store: &Arc<dyn ObjectStore>,
+        path: &Path,
+        rows: &[(&'static [u8], &'static [u8])],
+    ) {
+        let db = Db::builder(path.clone(), object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        for (k, v) in rows {
+            db.put(k, v).await.unwrap();
+        }
+        // The WAL first: a memtable flush with WAL writes still buffered
+        // leaves them in a WAL past the replay point it records.
+        db.flush().await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        db.close().await.unwrap();
+    }
+
+    fn row(k: &'static [u8], v: &'static [u8]) -> (Bytes, Bytes) {
+        (Bytes::from_static(k), Bytes::from_static(v))
+    }
+
+    /// A clone's initial rows are its own L0 table from initialization: with
+    /// a projection that excludes the parent's sentinel range, the child
+    /// holds its range of the parent and the initial rows, the initial
+    /// value winning for the key the parent also holds; without a
+    /// projection, an initial row shadows the parent's row of the same key.
+    #[tokio::test]
+    async fn should_hold_its_initial_rows_from_initialization() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent = Path::from("/tmp/seed_parent");
+        flushed_parent(
+            &object_store,
+            &parent,
+            &[(b"a1", b"p"), (b"a2", b"p"), (b"zz-sentinel", b"parent")],
+        )
+        .await;
+        let mut spec = CloneSourceSpec::new(parent.clone());
+        spec.projection_range = Some((
+            Bound::Included(Bytes::from_static(b"a")),
+            Bound::Excluded(Bytes::from_static(b"b")),
+        ));
+        let projected = Path::from("/tmp/seed_projected");
+        crate::db::builder::CloneBuilder::new(projected.clone(), spec, object_store.clone())
+            .with_initial_rows(vec![
+                row(b"zz-sentinel", b"seed"),
+                row(b"zz-other", b"seed"),
+            ])
+            .build()
+            .await
+            .unwrap();
+        let db = Db::builder(projected.clone(), object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            all_rows(&db).await,
+            vec![
+                row(b"a1", b"p"),
+                row(b"a2", b"p"),
+                row(b"zz-other", b"seed"),
+                row(b"zz-sentinel", b"seed"),
+            ]
+        );
+        db.close().await.unwrap();
+
+        let whole = Path::from("/tmp/seed_whole");
+        crate::db::builder::CloneBuilder::new(
+            whole.clone(),
+            CloneSourceSpec::new(parent.clone()),
+            object_store.clone(),
+        )
+        .with_initial_rows(vec![row(b"zz-sentinel", b"seed")])
+        .build()
+        .await
+        .unwrap();
+        let db = Db::builder(whole.clone(), object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            all_rows(&db).await,
+            vec![
+                row(b"a1", b"p"),
+                row(b"a2", b"p"),
+                row(b"zz-sentinel", b"seed")
+            ],
+            "the initial row shadows the parent's"
+        );
+        db.close().await.unwrap();
+    }
+
+    /// The initial rows are in L0, not in the WAL: once the seeded child is
+    /// opened (WAL on) and closed, a projected clone of it is allowed (no
+    /// data WAL), and its initial rows read back after a reopen.
+    #[tokio::test]
+    async fn should_not_replay_initial_rows_from_the_wal() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent = Path::from("/tmp/seed_wal_parent");
+        flushed_parent(&object_store, &parent, &[(b"a1", b"p")]).await;
+        let child = Path::from("/tmp/seed_wal_child");
+        crate::db::builder::CloneBuilder::new(
+            child.clone(),
+            CloneSourceSpec::new(parent.clone()),
+            object_store.clone(),
+        )
+        .with_initial_rows(vec![row(b"s1", b"seed")])
+        .build()
+        .await
+        .unwrap();
+        let db = Db::builder(child.clone(), object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        let l0 = db.manifest().l0().len();
+        db.close().await.unwrap();
+        assert_eq!(l0, 2, "the parent's L0 table and the seed's");
+        let mut spec = CloneSourceSpec::new(child.clone());
+        spec.projection_range = Some((Bound::Unbounded, Bound::Unbounded));
+        crate::db::builder::CloneBuilder::new(
+            Path::from("/tmp/seed_wal_grandchild"),
+            spec,
+            object_store.clone(),
+        )
+        .build()
+        .await
+        .expect("no data WAL in the seeded child");
+        let db = Db::builder(child.clone(), object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            all_rows(&db).await,
+            vec![row(b"a1", b"p"), row(b"s1", b"seed")]
+        );
+        db.close().await.unwrap();
+    }
+
+    /// A clone that failed before initialization writes its initial rows
+    /// when it resumes, once: the resumed clone holds them and its L0 holds
+    /// one seed table. An empty seed writes nothing; a seed with two rows of
+    /// one key, or beside a segment filter, is refused.
+    #[tokio::test]
+    async fn should_write_initial_rows_when_an_uninitialized_clone_resumes() {
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent = Path::from("/tmp/seed_resume_parent");
+        flushed_parent(&object_store, &parent, &[(b"a1", b"p")]).await;
+        let child = Path::from("/tmp/seed_resume_child");
+        let clone = |rows: Vec<(Bytes, Bytes)>, filter: Option<SegmentFilterFn>| {
+            let object_store = object_store.clone();
+            let fp_registry = fp_registry.clone();
+            let parent = parent.clone();
+            let child = child.clone();
+            async move {
+                let wal_admin = SlateDbWalAdmin::new(object_store.clone(), fp_registry.clone());
+                super::create_clone_seeded::<Path, (Bound<Bytes>, Bound<Bytes>)>(
+                    vec![CloneSourceSpec::new(parent)],
+                    child,
+                    object_store,
+                    Arc::new(wal_admin),
+                    fp_registry,
+                    Arc::new(DefaultSystemClock::new()),
+                    Arc::new(DbRand::default()),
+                    None,
+                    filter,
+                    None,
+                    Some(super::CloneSeed {
+                        rows,
+                        sst_format: crate::format::sst::SsTableFormat::default(),
+                    }),
+                )
+                .await
+            }
+        };
+        let doubled = clone(vec![row(b"s1", b"x"), row(b"s1", b"y")], None).await;
+        assert!(matches!(
+            doubled,
+            Err(SlateDBError::InvalidConfiguration(_))
+        ));
+        let keep_all: SegmentFilterFn = Arc::new(|_| true);
+        let segmented = clone(vec![row(b"s1", b"x")], Some(keep_all)).await;
+        assert!(matches!(
+            segmented,
+            Err(SlateDBError::InvalidConfiguration(_))
+        ));
+
+        fail_parallel::cfg(
+            Arc::clone(&fp_registry),
+            "create-clone-manifest-io-error",
+            "return",
+        )
+        .unwrap();
+        assert!(clone(vec![row(b"s1", b"seed")], None).await.is_err());
+        fail_parallel::cfg(
+            Arc::clone(&fp_registry),
+            "create-clone-manifest-io-error",
+            "off",
+        )
+        .unwrap();
+        let store = Arc::new(ManifestStore::new(&child, object_store.clone()));
+        let stored = StoredManifest::try_load(store, Arc::new(DefaultSystemClock::new()))
+            .await
+            .unwrap()
+            .expect("an uninitialized clone manifest");
+        assert!(
+            !stored.db_state().initialized,
+            "not initialized before the resume"
+        );
+
+        clone(vec![row(b"s1", b"seed")], None).await.unwrap();
+        let db = Db::builder(child.clone(), object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            all_rows(&db).await,
+            vec![row(b"a1", b"p"), row(b"s1", b"seed")]
+        );
+        assert_eq!(db.manifest().l0().len(), 2, "one seed table");
+        db.close().await.unwrap();
+
+        let empty = Path::from("/tmp/seed_empty_child");
+        crate::db::builder::CloneBuilder::new(
+            empty.clone(),
+            CloneSourceSpec::new(parent.clone()),
+            object_store.clone(),
+        )
+        .with_initial_rows(Vec::new())
+        .build()
+        .await
+        .unwrap();
+        let db = Db::builder(empty, object_store.clone())
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(db.manifest().l0().len(), 1, "an empty seed writes no table");
+        db.close().await.unwrap();
     }
 }
