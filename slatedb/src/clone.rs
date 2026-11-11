@@ -611,8 +611,16 @@ async fn validate_no_data_wal(
             .next_wal_sst_id
             .checked_sub(1)
             .ok_or(SlateDBError::InvalidDBState)?;
+        // A record at or below the source's `last_l0_seq` is in its L0 already (replay skips it), so
+        // only a record above it is WAL data the clone would drop or leak.
+        let last_l0_seq = source.manifest.core.last_l0_seq;
         if !wal_admin
-            .is_empty(&source.path, replay_after_wal_id, wal_id_last_seen)
+            .is_empty_above_seq(
+                &source.path,
+                replay_after_wal_id,
+                wal_id_last_seen,
+                last_l0_seq,
+            )
             .await?
         {
             parents_with_wal.push(source.path.clone());
@@ -3477,6 +3485,148 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(db.manifest().l0().len(), 1, "an empty seed writes no table");
+        db.close().await.unwrap();
+    }
+
+    /// A checkpoint of a db and the replay range its manifest names, for the WAL-floor tests.
+    async fn checkpoint_manifest(
+        path: &Path,
+        object_store: Arc<dyn ObjectStore>,
+        manifest_id: u64,
+    ) -> Manifest {
+        ManifestStore::new(path, object_store)
+            .read_manifest(manifest_id)
+            .await
+            .unwrap()
+    }
+
+    /// FORK.md K1: a checkpoint of everything taken while a write's WAL upload is in flight is
+    /// stamped with a replay point below that WAL, though the write is in the checkpoint's L0
+    /// (replay skips it as at or below `last_l0_seq`). A projection clone of that checkpoint
+    /// reads the write back instead of being refused as a source with WAL data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn should_clone_a_projection_of_a_checkpoint_whose_wal_records_are_in_l0() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_parent_wal_records_in_l0");
+        let clone_path = Path::from("/tmp/test_clone_wal_records_in_l0");
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        let db = Db::builder(parent_path.clone(), object_store.clone())
+            .with_settings(Settings {
+                flush_interval: None,
+                ..Settings::default()
+            })
+            .with_fp_registry(fp_registry.clone())
+            .build()
+            .await
+            .unwrap();
+        fail_parallel::cfg(fp_registry.clone(), "write-wal-sst-io-error", "pause").unwrap();
+        db.put(b"aaa-001", b"v1").await.unwrap();
+        let started = tokio::time::timeout(
+            Duration::from_secs(5),
+            db.begin_checkpoint(CheckpointScope::All, &CheckpointOptions::default()),
+        )
+        .await;
+        fail_parallel::remove(fp_registry, "write-wal-sst-io-error");
+        let checkpoint = started.unwrap().unwrap().wait().await.unwrap();
+        let manifest =
+            checkpoint_manifest(&parent_path, object_store.clone(), checkpoint.manifest_id).await;
+        assert!(
+            manifest.core.replay_after_wal_id + 1 < manifest.core.next_wal_sst_id,
+            "the checkpoint names a WAL above its replay point: {:?}",
+            (
+                manifest.core.replay_after_wal_id,
+                manifest.core.next_wal_sst_id
+            )
+        );
+
+        create_native_clone(
+            vec![CloneSourceSpec::with_checkpoint(
+                parent_path.clone(),
+                checkpoint.id,
+            )],
+            clone_path.clone(),
+            object_store.clone(),
+            object_store.clone(),
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            Some((
+                Bound::Included(Bytes::from_static(b"aaa")),
+                Bound::Excluded(Bytes::from_static(b"aab")),
+            )),
+            None,
+            None,
+        )
+        .await
+        .expect("every WAL record of the checkpoint is in its L0");
+        let clone_db = Db::builder(clone_path, object_store).build().await.unwrap();
+        assert_eq!(
+            clone_db.get(b"aaa-001").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        clone_db.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    /// A WAL record above the source's `last_l0_seq` is still refused: a durable checkpoint of a
+    /// write whose WAL is uploaded but whose memtable is not flushed names that WAL, and the write
+    /// is in no SST, so a projection clone would drop it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn should_fail_projection_clone_with_a_wal_record_above_last_l0_seq() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let parent_path = Path::from("/tmp/test_parent_wal_record_above_l0");
+        let clone_path = Path::from("/tmp/test_clone_wal_record_above_l0");
+        let db = Db::builder(parent_path.clone(), object_store.clone())
+            .with_settings(Settings {
+                flush_interval: None,
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        db.put(b"aaa-001", b"v1").await.unwrap();
+        db.flush().await.unwrap();
+        let checkpoint = db
+            .create_checkpoint(CheckpointScope::Durable, &CheckpointOptions::default())
+            .await
+            .unwrap();
+        let manifest =
+            checkpoint_manifest(&parent_path, object_store.clone(), checkpoint.manifest_id).await;
+        assert!(
+            manifest.core.replay_after_wal_id + 1 < manifest.core.next_wal_sst_id,
+            "the checkpoint names the write's WAL: {:?}",
+            (
+                manifest.core.replay_after_wal_id,
+                manifest.core.next_wal_sst_id
+            )
+        );
+
+        let err = create_native_clone(
+            vec![CloneSourceSpec::with_checkpoint(
+                parent_path.clone(),
+                checkpoint.id,
+            )],
+            clone_path,
+            object_store.clone(),
+            object_store,
+            Arc::new(FailPointRegistry::new()),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+            Some((
+                Bound::Included(Bytes::from_static(b"aaa")),
+                Bound::Excluded(Bytes::from_static(b"aab")),
+            )),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            SlateDBError::InvalidCloneSourceWithWal { paths } => {
+                assert_eq!(paths, vec![parent_path]);
+            }
+            other => panic!("expected InvalidCloneSourceWithWal, got {other:?}"),
+        }
         db.close().await.unwrap();
     }
 }

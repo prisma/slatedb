@@ -372,6 +372,35 @@ pub trait WalAdmin: Send + Sync + 'static {
         wal_id_last_seen: u64,
     ) -> Result<bool, WalError>;
 
+    /// Given a path, a WAL ID range and a sequence floor, returns true if the WAL at that path
+    /// holds no record above `last_l0_seq` within the range. A record at or below the floor is
+    /// already in the database's L0 and is never replayed (WAL replay starts after the manifest's
+    /// `last_l0_seq`), so a clone that reads only the source's SSTs loses nothing by ignoring it.
+    ///
+    /// The default is [`WalAdmin::is_empty`], which ignores the floor and is therefore
+    /// conservative: a WAL implementation that cannot read record sequence numbers may keep it.
+    ///
+    /// ## Arguments
+    /// - `path`: The database path containing the WAL.
+    /// - `replay_after_wal_id`: The exclusive lower bound of the WAL range to inspect.
+    /// - `wal_id_last_seen`: The inclusive upper bound of the WAL range to inspect.
+    /// - `last_l0_seq`: The highest sequence number the database's L0 already holds.
+    ///
+    /// ## Returns
+    /// `Ok(true)` if no record in the range is above `last_l0_seq`, `Ok(false)` if one is or the
+    /// range cannot be read record by record, or a [`WalError`] if the WAL could not be inspected.
+    async fn is_empty_above_seq(
+        &self,
+        path: &Path,
+        replay_after_wal_id: u64,
+        wal_id_last_seen: u64,
+        last_l0_seq: u64,
+    ) -> Result<bool, WalError> {
+        let _ = last_l0_seq;
+        self.is_empty(path, replay_after_wal_id, wal_id_last_seen)
+            .await
+    }
+
     /// Given a source path and manifest, copy the referenced WAL to a destination path and return
     /// a replay range. This call must be idempotent (TODO: clarify)
     ///

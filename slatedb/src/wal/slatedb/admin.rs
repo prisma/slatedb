@@ -125,6 +125,44 @@ impl WalAdmin for SlateDbWalAdmin {
         Ok(true)
     }
 
+    async fn is_empty_above_seq(
+        &self,
+        path: &Path,
+        replay_after_wal_id: u64,
+        wal_id_last_seen: u64,
+        last_l0_seq: u64,
+    ) -> Result<bool, WalError> {
+        if self
+            .is_empty(path, replay_after_wal_id, wal_id_last_seen)
+            .await?
+        {
+            return Ok(true);
+        }
+        // A WAL object that holds records: refuse only if one of them is above the floor. One
+        // that cannot be read record by record is treated as holding such a record (fail closed).
+        let reader = crate::wal_reader::WalReader::new(path.clone(), self.object_store.clone());
+        let Ok(files) = reader
+            .list((replay_after_wal_id + 1)..=wal_id_last_seen)
+            .await
+        else {
+            return Ok(false);
+        };
+        for file in files {
+            let Ok(mut entries) = file.iterator().await else {
+                return Ok(false);
+            };
+            loop {
+                match entries.next().await {
+                    Ok(Some(entry)) if entry.seq > last_l0_seq => return Ok(false),
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => return Ok(false),
+                }
+            }
+        }
+        Ok(true)
+    }
+
     async fn clone_wal(
         &self,
         from_path: &Path,
