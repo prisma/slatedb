@@ -60,6 +60,9 @@ pub(crate) enum BatchWriterMessage {
     WriteBatch(WriteBatchRequest),
     /// Flush the wal if enabled, and optionally freeze the current active memtable.
     Flush(BatchWriterFlush),
+    /// Request a WAL flush that freezes the current WAL at the WAL flush task's turn.
+    /// The sender gets the result when the request is queued.
+    RequestWalFlush(oneshot::Sender<Result<(), SlateDBError>>),
 }
 
 pub(crate) struct BatchWriterFlush {
@@ -95,6 +98,7 @@ impl std::fmt::Debug for BatchWriterMessage {
                 .debug_struct("Flush")
                 .field("freeze_memtable", freeze_memtable)
                 .finish(),
+            BatchWriterMessage::RequestWalFlush(_) => f.write_str("RequestWalFlush"),
         }
     }
 }
@@ -159,6 +163,17 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
                     }
                 }
             }
+            BatchWriterMessage::RequestWalFlush(done) => {
+                let Some(wal_writer) = self.wal_writer.as_mut() else {
+                    // `DbInner::request_wal_flush` checks this first. The caller gets the
+                    // error, and the writer continues: no WAL writer is not a write failure.
+                    let _ = done.send(Err(SlateDBError::WalDisabled));
+                    return Ok(());
+                };
+                let result = wal_writer.request_flush().await.map_err(Into::into);
+                let _ = done.send(result.clone());
+                result
+            }
         }
     }
 
@@ -178,6 +193,9 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
                         freeze_memtable: _,
                         done,
                     } = flush_msg;
+                    let _ = done.send(Err(error.clone()));
+                }
+                BatchWriterMessage::RequestWalFlush(done) => {
                     let _ = done.send(Err(error.clone()));
                 }
             }
@@ -401,6 +419,16 @@ impl DbInner {
     ) -> Result<(), SlateDBError> {
         let (flush_result, _) = self.begin_batch_writer_flush(freeze_memtable).await?;
         Ok(flush_result.await?)
+    }
+
+    /// Sends a [`BatchWriterMessage::RequestWalFlush`] to the writer event loop. Returns when
+    /// the writer has queued the request with the WAL writer, not when the WAL is durable.
+    #[instrument(level = "trace", skip_all, err(level = tracing::Level::DEBUG))]
+    pub(crate) async fn request_batch_writer_wal_flush(&self) -> Result<(), SlateDBError> {
+        let (done, rx) = oneshot::channel();
+        self.write_notifier
+            .send(BatchWriterMessage::RequestWalFlush(done))?;
+        rx.await?
     }
 
     pub(crate) async fn begin_batch_writer_flush(

@@ -253,6 +253,14 @@ impl WalWriter for SlateDbWalWriter {
         })
     }
 
+    /// Sends the flush task the message that its timer sends. The task freezes
+    /// the current WAL when it gets to the message. Thus a write appended
+    /// between the call and the task's turn goes to the same WAL object, as
+    /// `flush()` did before #2084.
+    async fn request_flush(&mut self) -> Result<(), WalError> {
+        self.send_flush_request(None)
+    }
+
     async fn close(&mut self) -> Result<(), WalError> {
         if let Some(result) = self
             .task_executor
@@ -990,6 +998,45 @@ mod tests {
             assert_eq!(iter.next().await.unwrap().unwrap().key, Bytes::from(key));
             assert!(iter.next().await.unwrap().is_none());
         }
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_request_flush_freezes_the_wal_at_the_flush_tasks_turn() {
+        let (mut writer, table_store, _, _) =
+            setup_wal_buffer_with_flush_interval(Duration::from_secs(3600)).await;
+        writer
+            .append(&[make_entry("before", "v1", 1, None)])
+            .await
+            .unwrap();
+        writer.request_flush().await.unwrap();
+        // Appended after the request and before the flush task's turn: this test runs on one
+        // thread, and nothing above yields to the flush task.
+        writer
+            .append(&[make_entry("after", "v2", 2, None)])
+            .await
+            .unwrap();
+
+        // The flush task froze the WAL at its turn, so one WAL object holds both writes.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while writer.status().unwrap().last_flushed_seq != Some(2) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the requested flush did not make seq 2 durable");
+        let status = writer.status().unwrap();
+        assert_eq!(status.last_flushed_wal_id, 1);
+        assert_eq!(status.buffered_wal_entries_count, 0);
+        let table = table_store.open_sst(1.into()).await.unwrap();
+        let mut iter =
+            WalSstIterator::new(table, table_store.clone(), WalSstIteratorOptions::default())
+                .await
+                .unwrap();
+        for key in ["before", "after"] {
+            assert_eq!(iter.next().await.unwrap().unwrap().key, Bytes::from(key));
+        }
+        assert!(iter.next().await.unwrap().is_none());
         writer.close().await.unwrap();
     }
 

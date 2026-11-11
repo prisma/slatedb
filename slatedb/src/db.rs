@@ -450,6 +450,16 @@ impl DbInner {
         }
     }
 
+    /// Requests a WAL flush through the batch writer. See [`Db::request_wal_flush`].
+    pub(crate) async fn request_wal_flush(&self) -> Result<(), SlateDBError> {
+        self.db_stats.flush_requests.increment(1);
+        self.check_closed()?;
+        if !self.wal_enabled {
+            return Err(SlateDBError::WalDisabled);
+        }
+        self.request_batch_writer_wal_flush().await
+    }
+
     async fn replay_wal(&self, wal_iterator: Box<dyn WalIterator>) -> Result<(), SlateDBError> {
         let mut current_memtable_wal_id = self
             .state
@@ -1811,6 +1821,56 @@ impl Db {
     /// ```
     pub async fn flush_with_options(&self, options: FlushOptions) -> Result<(), crate::Error> {
         self.inner.flush(options, true).await.map_err(Into::into)
+    }
+
+    /// Request a WAL flush, and return when the request is queued.
+    ///
+    /// [`Db::flush`] freezes the current WAL when you call it, and it returns when that WAL is
+    /// durable. This method does not freeze the WAL. The WAL flush task freezes the current WAL
+    /// when it gets to the request, as it does for a flush that `flush_interval` starts. Thus
+    /// writes applied between the call and the task's turn go to the same WAL object. This is
+    /// useful for a group commit: one flush in flight, and writes that arrive while it waits
+    /// go with it, not with a second object or the next flush.
+    ///
+    /// The flush includes every write applied before this call returned. A write applied after
+    /// the call returned can be in this flush or in a later one.
+    ///
+    /// `Ok` means only that the request is queued. The method does not wait for the upload and
+    /// gives no WAL ID. Use [`Db::subscribe`] or [`Db::status`] to know when a write is durable.
+    /// A failed upload closes the database. Thus watch `DbStatus::close_reason` together with
+    /// `durable_seq`: if the upload fails, `close_reason` is set and `durable_seq` does not get
+    /// to the write. Keep [`Db::flush`] where you need the frozen WAL, for example before a
+    /// checkpoint.
+    ///
+    /// ## Errors
+    /// - `Error`: if the WAL is disabled, the database is closed, or the WAL writer has failed.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// use slatedb::{Db, Error};
+    /// use slatedb::object_store::{ObjectStore, memory::InMemory};
+    /// use std::sync::Arc;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Error> {
+    ///     let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    ///     let db = Db::open("test_db", object_store).await?;
+    ///     let write = db.put(b"key", b"value").await?;
+    ///     db.request_wal_flush().await?;
+    ///     let mut status = db.subscribe();
+    ///     let durable = status
+    ///         .wait_for(|s| s.durable_seq >= write.seqnum() || s.close_reason.is_some())
+    ///         .await
+    ///         .expect("status watch closed")
+    ///         .close_reason
+    ///         .is_none();
+    ///     assert!(durable);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn request_wal_flush(&self) -> Result<(), crate::Error> {
+        self.inner.request_wal_flush().await.map_err(Into::into)
     }
 
     /// Refresh the manifest immediately and wait for it to complete.
@@ -5341,6 +5401,45 @@ mod tests {
         assert_eq!(retrieved_value1.as_ref(), value1);
     }
 
+    #[tokio::test]
+    #[cfg(feature = "wal_disable")]
+    async fn test_request_wal_flush_wal_disabled_error() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let mut options = test_db_options(0, 1024, None);
+        options.wal_enabled = false;
+        let db = Db::builder("/tmp/test_request_wal_flush_wal_disabled", object_store)
+            .with_settings(options)
+            .build()
+            .await
+            .unwrap();
+
+        let error = db.request_wal_flush().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("attempted a WAL operation when the WAL is disabled"),
+            "Expected WalDisabled error message, got: {}",
+            error
+        );
+        // The error does not close the database.
+        assert!(db.status().close_reason.is_none());
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_request_wal_flush_after_close_returns_closed() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Db::builder("/tmp/test_request_wal_flush_after_close", object_store)
+            .with_settings(test_db_options(0, 1024, None))
+            .build()
+            .await
+            .unwrap();
+
+        db.close().await.unwrap();
+        let err = db.request_wal_flush().await.unwrap_err();
+        assert_eq!(err.kind(), crate::ErrorKind::Closed(CloseReason::Clean));
+    }
+
     // 2 threads so we can can wait on the write_with_options (main) thread
     // while the write_batch (background) thread is blocked on writing the
     // WAL SST.
@@ -6665,6 +6764,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(result.to_string().contains("background task panicked"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_request_wal_flush_under_a_continuous_writer_makes_one_wal_per_request() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let db = Arc::new(
+            Db::builder(
+                "/tmp/test_request_wal_flush_under_a_continuous_writer",
+                object_store,
+            )
+            .with_settings(Settings {
+                flush_interval: None,
+                compactor_options: None,
+                garbage_collector_options: None,
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap(),
+        );
+        // A writer that keeps writing while the flushes run, as a group-commit pump sees it.
+        let stop = Arc::new(AtomicBool::new(false));
+        let newest = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = {
+            let (db, stop, newest) = (Arc::clone(&db), Arc::clone(&stop), Arc::clone(&newest));
+            tokio::spawn(async move {
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let key = format!("key-{i}");
+                    let write = db.put(key.as_bytes(), b"value").await.unwrap();
+                    newest.fetch_max(write.seqnum(), Ordering::Relaxed);
+                    i += 1;
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        while newest.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let mut status = db.subscribe();
+        let first_wal_id = db.inner.wal_observer.status().unwrap().last_flushed_wal_id;
+        for _ in 0..20 {
+            // As the pump does: capture the newest applied write, request, wait for durability.
+            let target = newest.load(Ordering::Relaxed);
+            db.request_wal_flush().await.unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                status.wait_for(|s| s.durable_seq >= target),
+            )
+            .await
+            .expect("a requested flush did not make the captured write durable")
+            .unwrap();
+        }
+        let last_wal_id = db.inner.wal_observer.status().unwrap().last_flushed_wal_id;
+        stop.store(true, Ordering::Relaxed);
+        writer.await.unwrap();
+
+        // Each request writes at most one WAL object: the flush task freezes the WAL once, at
+        // its turn, and writes applied after the request go into that same object.
+        let wal_objects = last_wal_id - first_wal_id;
+        assert!(
+            (1..=20).contains(&wal_objects),
+            "20 requests wrote {wal_objects} WAL objects"
+        );
+        db.close().await.unwrap();
     }
 
     #[tokio::test]
