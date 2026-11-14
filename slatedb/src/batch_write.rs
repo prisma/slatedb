@@ -465,6 +465,11 @@ impl DbInner {
     /// the batch's touched-segment prefixes on it. Returns a durable
     /// watcher for the memtable. When no extractor is configured,
     /// `touched_segments` is empty and recording is a no-op.
+    ///
+    /// `entries` come from [`WriteBatch::extract_entries`]: unique keys in ascending order,
+    /// all with the batch's sequence number. [`KVTable::put_sorted`] therefore starts each
+    /// insert from the previous one. This task is the memtable's only writer, and the read
+    /// lock keeps the memtable from being frozen while the batch is inserted.
     fn write_entries_to_memtable(
         &self,
         entries: Vec<RowEntry>,
@@ -474,7 +479,7 @@ impl DbInner {
         let memtable = guard.memtable();
         self.status_manager.add_memtable_segments(&touched_segments);
         memtable.record_touched_segments(touched_segments.clone());
-        entries.into_iter().for_each(|entry| memtable.put(entry));
+        memtable.put_sorted(entries);
         memtable.table().durable_watcher()
     }
 

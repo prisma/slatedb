@@ -296,6 +296,190 @@ struct Position<'a, K, V> {
     right: [Shared<'a, Node<K, V>>; MAX_HEIGHT],
 }
 
+// SlateDB fork (not in crossbeam-skiplist 0.1.3): `Finger`, `FingerStats`, `FingerAt`,
+// `FingerCursor`, `SkipList::finger` and `SkipList::search_position_from`, and the
+// `finger` argument of `insert_internal`. See `vendor/crossbeam-skiplist/README.md`.
+
+/// An insert cursor for a batch of keys in ascending order: it remembers where the previous
+/// insert linked its node (its predecessor at every level), so that the next insert can start
+/// its search there instead of at the head.
+///
+/// Create one with [`SkipList::finger`]. It borrows the list and the [`Guard`] it was made
+/// with, so it can only be used on that list and only while that guard keeps the thread pinned:
+/// the nodes it names cannot be reclaimed while it exists.
+///
+/// # When the finger is not used
+///
+/// An insert searches from the head, exactly as [`SkipList::compare_insert`] does, when:
+///
+/// - the finger is empty (the first insert);
+/// - the key is not above the key the finger last linked (a batch out of order, or an equal
+///   key), since then the finger's predecessors are not known to be below the key;
+/// - the search from the finger meets a node marked as removed that it cannot unlink, including
+///   a predecessor the finger holds that has since been removed (a stale finger).
+///
+/// Every retry inside an insert (a failed CAS, a replaced node) also searches from the head, as
+/// upstream does. [`Finger::stats`] counts each case.
+///
+/// # Why a finger is correct
+///
+/// A skip-list search may start a level from any node that is linked at that level and whose
+/// key is below the search key: walking forward from such a node reaches the same predecessor
+/// and successor as walking from the head. The finger only ever starts a level from such a
+/// node:
+///
+/// - Its predecessors are at or before the node it last linked, whose key it checks is below
+///   the new key (one comparison), so every one of them is below the new key.
+/// - A node is marked at a level before it is unlinked there, and a node is never relinked. So
+///   a predecessor whose pointer at that level is unmarked when the search loads it is linked at
+///   that level, and one that is marked sends the insert back to the head.
+/// - The nodes stay allocated: the finger borrows the guard, and a node is only freed after
+///   every thread pinned at its unlinking has unpinned.
+///
+/// The level-0 link is then the same CAS as upstream's, from a predecessor whose next pointer
+/// was unmarked and equal to the successor, so a concurrent insert or removal makes it fail and
+/// retry from the head. Concurrent writers and removals therefore stay correct; they only cost
+/// head searches.
+pub struct Finger<'g, K, V> {
+    list: &'g SkipList<K, V>,
+    guard: &'g Guard,
+    cursor: FingerCursor<'g, K, V>,
+}
+
+/// Counts of how a [`Finger`]'s inserts searched, for tests and benchmarks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FingerStats {
+    /// Inserts whose first search started from the finger.
+    pub from_finger: u64,
+    /// Inserts that searched from the head because the finger was empty.
+    pub empty: u64,
+    /// Inserts that searched from the head because the key was not above the finger's key.
+    pub out_of_order: u64,
+    /// Inserts that searched from the head because the search from the finger met a removed
+    /// node it could not unlink, such as a predecessor the finger holds that was removed.
+    pub stale: u64,
+}
+
+/// Where the previous insert through a finger linked its node.
+struct FingerAt<'g, K, V> {
+    /// The node linked. Its key is at or above every predecessor in `left`.
+    node: &'g Node<K, V>,
+    /// At each level, the node itself if it was linked at that level, and otherwise its
+    /// predecessor there (the head above the list's height).
+    left: [&'g Tower<K, V>; MAX_HEIGHT],
+}
+
+/// A finger's state, passed to `insert_internal`.
+struct FingerCursor<'g, K, V> {
+    at: Option<FingerAt<'g, K, V>>,
+    stats: FingerStats,
+}
+
+/// Why a search from a finger was given up for a search from the head.
+enum FingerMiss {
+    /// The key is not above the finger's key.
+    OutOfOrder,
+    /// A removed node was met and could not be unlinked.
+    Stale,
+}
+
+impl<'g, K: Ord, V> FingerCursor<'g, K, V> {
+    /// The first search of an insert of `key`: from the finger when it can be used, from the
+    /// head otherwise.
+    fn search_position(
+        &mut self,
+        list: &'g SkipList<K, V>,
+        key: &K,
+        guard: &'g Guard,
+    ) -> Position<'g, K, V> {
+        let at = match &self.at {
+            Some(at) => at,
+            None => {
+                self.stats.empty += 1;
+                return list.search_position(key, guard);
+            }
+        };
+        match list.search_position_from(key, at, guard) {
+            Ok(position) => {
+                self.stats.from_finger += 1;
+                position
+            }
+            Err(FingerMiss::OutOfOrder) => {
+                self.stats.out_of_order += 1;
+                list.search_position(key, guard)
+            }
+            Err(FingerMiss::Stale) => {
+                self.stats.stale += 1;
+                list.search_position(key, guard)
+            }
+        }
+    }
+
+    /// Records the node an insert linked at levels `0..linked`, with `left` the predecessors of
+    /// the insert's last search.
+    fn record(
+        &mut self,
+        node: &'g Node<K, V>,
+        linked: usize,
+        mut left: [&'g Tower<K, V>; MAX_HEIGHT],
+    ) {
+        for tower in left.iter_mut().take(linked) {
+            *tower = &node.tower;
+        }
+        self.at = Some(FingerAt { node, left });
+    }
+}
+
+impl<'g, K, V> Finger<'g, K, V>
+where
+    K: Ord + Send + 'static,
+    V: Send + 'static,
+{
+    /// Inserts `key` and `value` as [`SkipList::compare_insert`] does, starting the search from
+    /// where this finger's previous insert linked its node when that is possible (see
+    /// [`Finger`]).
+    ///
+    /// The returned entry must be released, as any [`RefEntry`].
+    pub fn compare_insert<F>(&mut self, key: K, value: V, compare_fn: F) -> RefEntry<'g, K, V>
+    where
+        F: Fn(&V) -> bool,
+    {
+        self.list.insert_internal(
+            key,
+            || value,
+            compare_fn,
+            Some(&mut self.cursor),
+            self.guard,
+        )
+    }
+
+    /// Inserts `key` and `value` as [`SkipList::insert`] does, replacing an entry with an equal
+    /// key, starting from the finger when that is possible.
+    pub fn insert(&mut self, key: K, value: V) -> RefEntry<'g, K, V> {
+        self.compare_insert(key, value, |_| true)
+    }
+}
+
+impl<'g, K, V> Finger<'g, K, V> {
+    /// The guard this finger was made with.
+    pub fn guard(&self) -> &'g Guard {
+        self.guard
+    }
+
+    /// How this finger's inserts have searched so far.
+    pub fn stats(&self) -> FingerStats {
+        self.cursor.stats
+    }
+}
+
+impl<K, V> fmt::Debug for Finger<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Finger")
+            .field("stats", &self.cursor.stats)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Frequently modified data associated with a skip list.
 struct HotData {
     /// The seed for random height generation.
@@ -477,7 +661,7 @@ where
 
     /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist.
     pub fn get_or_insert(&self, key: K, value: V, guard: &Guard) -> RefEntry<'_, K, V> {
-        self.insert_internal(key, || value, |_| false, guard)
+        self.insert_internal(key, || value, |_| false, None, guard)
     }
 
     /// Finds an entry with the specified key, or inserts a new `key`-`value` pair if none exist,
@@ -492,7 +676,7 @@ where
     where
         F: FnOnce() -> V,
     {
-        self.insert_internal(key, value, |_| false, guard)
+        self.insert_internal(key, value, |_| false, None, guard)
     }
 
     /// Returns an iterator over all entries in the skip list.
@@ -849,16 +1033,117 @@ where
         }
     }
 
+    /// [`search_position`](Self::search_position) for `key`, starting from the finger `at`
+    /// rather than the head (SlateDB fork).
+    ///
+    /// At each level the search starts from the finger's predecessor there while it has not
+    /// moved past a node at a higher level. Until then the finger's predecessor at this level is
+    /// at or after the node the search came down from, so it saves steps. Once the search moves
+    /// past a node, it carries on down from that node as upstream does. That node is linked and
+    /// below `key`, so the search stays correct. With one writer, the node is above the finger's
+    /// key, so the finger cannot help below it. Another writer can link a node between a
+    /// finger's predecessor and the finger's node. The search can then move past a node below
+    /// the finger's key, and it loses the shortcut on the levels below.
+    ///
+    /// It gives up (and the caller searches from the head) when `key` is not above the
+    /// finger's key, or when it meets a removed node: either a predecessor of the finger whose
+    /// pointer at that level is marked, or a removed node it cannot unlink. Upstream restarts
+    /// from the head in the second case too.
+    fn search_position_from<'a>(
+        &'a self,
+        key: &K,
+        at: &FingerAt<'a, K, V>,
+        guard: &'a Guard,
+    ) -> Result<Position<'a, K, V>, FingerMiss> {
+        // Every predecessor in `at.left` is at or before `at.node`, so this one comparison
+        // shows that all of them are below `key`.
+        if at.node.key >= *key {
+            return Err(FingerMiss::OutOfOrder);
+        }
+
+        unsafe {
+            let mut result = Position {
+                found: None,
+                left: [&*self.head; MAX_HEIGHT],
+                right: [Shared::null(); MAX_HEIGHT],
+            };
+
+            let mut level = self.hot_data.max_height.load(Ordering::Relaxed);
+            while level >= 1
+                && self.head[level - 1]
+                    .load(Ordering::Relaxed, guard)
+                    .is_null()
+            {
+                level -= 1;
+            }
+
+            let mut pred = &*self.head;
+            // True until the search moves past a node.
+            let mut on_finger = true;
+
+            while level >= 1 {
+                level -= 1;
+
+                if on_finger {
+                    pred = at.left[level];
+                }
+
+                let mut curr = pred[level].load_consume(guard);
+
+                // `pred` is removed. When it is one of the finger's predecessors, the finger is
+                // stale. Upstream restarts from the head here, and so does the caller.
+                if curr.tag() == 1 {
+                    return Err(FingerMiss::Stale);
+                }
+
+                while let Some(c) = curr.as_ref() {
+                    let succ = c.tower[level].load_consume(guard);
+
+                    if succ.tag() == 1 {
+                        if let Some(c) = self.help_unlink(&pred[level], c, succ, guard) {
+                            curr = c;
+                            continue;
+                        } else {
+                            return Err(FingerMiss::Stale);
+                        }
+                    }
+
+                    match c.key.cmp(key) {
+                        cmp::Ordering::Greater => break,
+                        cmp::Ordering::Equal => {
+                            result.found = Some(c);
+                            break;
+                        }
+                        cmp::Ordering::Less => {}
+                    }
+
+                    pred = &c.tower;
+                    curr = succ;
+                    on_finger = false;
+                }
+
+                result.left[level] = pred;
+                result.right[level] = curr;
+            }
+
+            Ok(result)
+        }
+    }
+
     /// Inserts an entry with the specified `key` and `value`.
     ///
     /// If `replace` is `true`, then any existing entry with this key will first be removed.
-    fn insert_internal<F, CompareF>(
-        &self,
+    ///
+    /// SlateDB fork: with a `finger`, the first search starts from it (see [`Finger`]), and the
+    /// node linked is recorded in it. Every later search in this insert starts from the head.
+    fn insert_internal<'a, F, CompareF>(
+        &'a self,
         key: K,
         value: F,
         replace: CompareF,
+        mut finger: Option<&mut FingerCursor<'a, K, V>>,
         guard: &Guard,
-    ) -> RefEntry<'_, K, V>
+    ) -> RefEntry<'a, K, V>
     where
         F: FnOnce() -> V,
         CompareF: Fn(&V) -> bool,
@@ -869,13 +1154,18 @@ where
             // Rebind the guard to the lifetime of self. This is a bit of a
             // hack but it allows us to return references that are not bound to
             // the lifetime of the guard.
-            let guard = &*(guard as *const _);
+            let guard: &'a Guard = &*(guard as *const _);
 
             let mut search;
+            let mut first_search = true;
             loop {
                 // First try searching for the key.
                 // Note that the `Ord` implementation for `K` may panic during the search.
-                search = self.search_position(&key, guard);
+                search = match finger.as_deref_mut() {
+                    Some(finger) if first_search => finger.search_position(self, &key, guard),
+                    _ => self.search_position(&key, guard),
+                };
+                first_search = false;
 
                 let r = match search.found {
                     Some(r) => r,
@@ -985,6 +1275,9 @@ where
                 node: n,
             };
 
+            // The levels at which the new node is linked, for the finger (SlateDB fork).
+            let mut linked = 1;
+
             // Build the rest of the tower above level 0.
             'build: for level in 1..height {
                 loop {
@@ -1049,6 +1342,7 @@ where
                         .is_ok()
                     {
                         // Success! Continue on the next level.
+                        linked = level + 1;
                         break;
                     }
 
@@ -1077,6 +1371,12 @@ where
                 self.search_bound(Bound::Included(&n.key), false, guard);
             }
 
+            // SlateDB fork: the next insert through the finger starts here. If the node is
+            // being removed, its marked pointers make that insert search from the head.
+            if let Some(finger) = finger {
+                finger.record(n, linked, search.left);
+            }
+
             // Finally, return the new entry.
             entry
         }
@@ -1093,7 +1393,7 @@ where
     /// If there is an existing entry with this key, it will be removed before inserting the new
     /// one.
     pub fn insert(&self, key: K, value: V, guard: &Guard) -> RefEntry<'_, K, V> {
-        self.insert_internal(key, || value, |_| true, guard)
+        self.insert_internal(key, || value, |_| true, None, guard)
     }
 
     /// Inserts a `key`-`value` pair into the skip list and returns the new entry.
@@ -1111,7 +1411,23 @@ where
     where
         F: Fn(&V) -> bool,
     {
-        self.insert_internal(key, || value, compare_fn, guard)
+        self.insert_internal(key, || value, compare_fn, None, guard)
+    }
+
+    /// Returns an empty [`Finger`] for inserting a batch of keys in ascending order, each insert
+    /// starting where the previous one ended (SlateDB fork).
+    ///
+    /// The finger borrows `guard`: keep the thread pinned with one guard for the whole batch.
+    pub fn finger<'g>(&'g self, guard: &'g Guard) -> Finger<'g, K, V> {
+        self.check_guard(guard);
+        Finger {
+            list: self,
+            guard,
+            cursor: FingerCursor {
+                at: None,
+                stats: FingerStats::default(),
+            },
+        }
     }
 
     /// Removes an entry with the specified `key` from the map and returns it.
@@ -2038,7 +2354,9 @@ impl<K, V> Drop for IntoIter<K, V> {
             unsafe {
                 // Unprotected loads are okay because this function is the only one currently using
                 // the skip list.
-                let next = (*self.node).tower[0].load(Ordering::Relaxed, epoch::unprotected());
+                // SlateDB fork: an explicit `&` for `dangerous_implicit_autorefs` (deny by
+                // default since Rust 1.89, and not capped for a path dependency).
+                let next = (&(*self.node).tower)[0].load(Ordering::Relaxed, epoch::unprotected());
 
                 // We can safely do this without deferring because references to
                 // keys & values that we give out never outlive the SkipList.
@@ -2069,7 +2387,9 @@ impl<K, V> Iterator for IntoIter<K, V> {
                 //
                 // Unprotected loads are okay because this function is the only one currently using
                 // the skip list.
-                let next = (*self.node).tower[0].load(Ordering::Relaxed, epoch::unprotected());
+                // SlateDB fork: an explicit `&` for `dangerous_implicit_autorefs` (deny by
+                // default since Rust 1.89, and not capped for a path dependency).
+                let next = (&(*self.node).tower)[0].load(Ordering::Relaxed, epoch::unprotected());
 
                 // Deallocate the current node and move to the next one.
                 Node::dealloc(self.node);

@@ -7998,6 +7998,121 @@ mod tests {
         panic!("manifest condition took longer than timeout")
     }
 
+    /// Pins the invariants `KVTable::put_sorted` relies on: every write path into the mutable
+    /// memtable, before and after a WAL replay, inserts each batch through one finger in key
+    /// order, with no insert out of order, none that replaces a row (which removes a node) and
+    /// none that meets a removed node. Debug builds also check that the memtable has one writer.
+    #[tokio::test]
+    async fn should_write_the_mutable_memtable_in_key_order_without_removals() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = "/tmp/test_mutable_memtable_in_key_order_without_removals";
+        let mut settings = test_db_options(0, 1 << 30, None);
+        settings.flush_interval = None;
+        settings.max_unflushed_bytes = 2 << 30;
+        settings.max_wal_flushes_before_l0_flush = u64::MAX;
+        let open = || {
+            Db::builder(path, object_store.clone())
+                .with_settings(settings.clone())
+                .with_merge_operator(Arc::new(StringConcatMergeOperator))
+                .build()
+        };
+        let counts = |db: &Db| {
+            let state = db.inner.state.read();
+            assert!(
+                state.state().imm_memtable.is_empty(),
+                "the memtable was frozen"
+            );
+            let table = state.memtable().table().clone();
+            (table.insert_counts(), table.metadata().entry_num)
+        };
+
+        async fn write_every_way(db: &Db, round: u8) {
+            let key = |name: &str| format!("{round}-{name}").into_bytes();
+            db.put(key("put"), b"v").await.unwrap();
+            db.put(key("put"), b"v2").await.unwrap();
+            db.delete(key("put")).await.unwrap();
+            db.merge(key("merge"), b"a").await.unwrap();
+            db.put_with_options(
+                key("ttl"),
+                b"v",
+                &PutOptions {
+                    ttl: Ttl::ExpireAfterMillis(60_000),
+                },
+                &WriteOptions::default(),
+            )
+            .await
+            .unwrap();
+            // A batch with keys out of order, a key put twice, a put then a delete, and merges
+            // folded into one row.
+            let mut batch = WriteBatch::new();
+            for name in ["z", "b", "m", "b", "a"] {
+                batch.put(key(name), b"v");
+            }
+            batch.put(key("gone"), b"v");
+            batch.delete(key("gone"));
+            for operand in [b"x", b"y", b"z"] {
+                batch.merge(key("merged"), operand);
+            }
+            db.write(batch).await.unwrap();
+            // A user-supplied sequence number.
+            let mut batch = WriteBatch::new();
+            batch.put(key("seqnum-b"), b"v");
+            batch.put(key("seqnum-a"), b"v");
+            let seqnum = db.inner.oracle.last_seq() + 10;
+            db.write_with_options(
+                batch,
+                &WriteOptions {
+                    #[cfg(dst)]
+                    now: 0,
+                    seqnum,
+                },
+            )
+            .await
+            .unwrap();
+            // A transaction.
+            let txn = db.begin(IsolationLevel::SerializableSnapshot).unwrap();
+            txn.put(key("txn-b"), b"v").unwrap();
+            txn.put(key("txn-a"), b"v").unwrap();
+            txn.merge(key("txn-merge"), b"m").unwrap();
+            txn.delete(key("txn-gone")).unwrap();
+            txn.commit().await.unwrap();
+        }
+
+        // when: every write path, then a reopen whose WAL replay installs the replayed table as
+        // the mutable memtable, then every write path again.
+        let db = open().await.unwrap();
+        write_every_way(&db, 1).await;
+        let (first, first_entries) = counts(&db);
+        db.close_with_options(CloseOptions::default().with_flush_type(Some(FlushType::Wal)))
+            .await
+            .unwrap();
+        let db = open().await.unwrap();
+        let (replayed, replayed_entries) = counts(&db);
+        write_every_way(&db, 2).await;
+        let (second, second_entries) = counts(&db);
+        db.close().await.unwrap();
+
+        // then
+        assert!(first_entries > 0);
+        assert_eq!(first.replaced, 0);
+        assert_eq!(first.finger.out_of_order + first.finger.stale, 0);
+        assert_eq!(
+            first.finger.from_finger + first.finger.empty,
+            first_entries as u64
+        );
+        assert_eq!(
+            replayed_entries, first_entries,
+            "the WAL replay restored the rows"
+        );
+        assert_eq!(replayed.replaced, 0);
+        assert_eq!(second.replaced, 0);
+        assert_eq!(second.finger.out_of_order + second.finger.stale, 0);
+        assert_eq!(
+            second.finger.from_finger + second.finger.empty,
+            (second_entries - replayed_entries) as u64
+        );
+    }
+
     fn test_db_options(
         min_filter_keys: u32,
         l0_sst_size_bytes: usize,

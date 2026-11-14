@@ -11,6 +11,8 @@ members = [
     "slatedb-cli",
     "slatedb-txn-obj",
 ]
+# A vendored dependency, built and tested on its own (see its README.md).
+exclude = ["vendor/crossbeam-skiplist"]
 
 [workspace.package]
 version = "0.17.0"
@@ -44,7 +46,9 @@ chrono = "0.4.41"
 clap = "4.5.44"
 crc32fast = "1.5.0"
 crossbeam-channel = "0.5.15"
-crossbeam-skiplist = "0.1.3"
+crossbeam-epoch = "0.9.18"
+# crossbeam-skiplist 0.1.3 with a finger insert for sorted batches (see its README.md).
+crossbeam-skiplist = { path = "vendor/crossbeam-skiplist" }
 dotenvy = "0.15.7"
 duration-str = { version = "0.11.2", default-features = false }
 fail-parallel = "0.6.0"

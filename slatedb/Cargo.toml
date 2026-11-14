@@ -70,6 +70,8 @@ url = "2.5.4"
 backtrace = "0.3"
 bincode = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio", "html_reports"] }
+# benches/memtable_put_sorted.rs pins the epoch for its control arm.
+crossbeam-epoch = { workspace = true }
 ctor = { workspace = true }
 fail-parallel = { workspace = true, features = ["failpoints"] }
 figment = { workspace = true, features = ["test"] }
@@ -168,6 +170,11 @@ harness = false
 [[bench]]
 name = "memtable_seek"
 harness = false
+
+[[bench]]
+name = "memtable_put_sorted"
+harness = false
+required-features = ["bench-internal"]
 
 [lints]
 workspace = true

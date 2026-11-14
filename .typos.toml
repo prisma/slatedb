@@ -6,3 +6,5 @@
 "seeked" = "seeked"
 
 [files]
+# Vendored crates keep their upstream text.
+extend-exclude = ["vendor/"]

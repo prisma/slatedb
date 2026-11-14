@@ -6,6 +6,7 @@ use std::mem::ManuallyDrop;
 use std::ops::{Bound, RangeBounds};
 use std::ptr;
 
+pub use crate::base::FingerStats;
 use crate::base::{self, try_pin_loop};
 use crossbeam_epoch as epoch;
 
@@ -404,6 +405,40 @@ where
         Entry::new(self.inner.compare_insert(key, value, compare_fn, guard))
     }
 
+    /// Calls `f` with a [`Finger`] for inserting a batch of keys in ascending order (SlateDB
+    /// fork).
+    ///
+    /// Each insert through the finger starts its search where the previous one linked its node,
+    /// not at the head, when its key is above the previous one. An insert out of order, or of
+    /// an equal key, searches from the head and is correct. The thread stays pinned while `f`
+    /// runs. See [`base::Finger`] for why this is correct with concurrent readers and writers.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use crossbeam_skiplist::SkipMap;
+    ///
+    /// let map = SkipMap::new();
+    /// let stats = map.with_finger(|finger| {
+    ///     for key in [1, 3, 5, 7] {
+    ///         finger.insert(key, key * 10);
+    ///     }
+    ///     finger.stats()
+    /// });
+    /// assert_eq!(stats.from_finger, 3);
+    /// assert_eq!(*map.get(&5).unwrap().value(), 50);
+    /// ```
+    pub fn with_finger<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut Finger<'_, K, V>) -> R,
+    {
+        let guard = &epoch::pin();
+        let mut finger = Finger {
+            inner: self.inner.finger(guard),
+        };
+        f(&mut finger)
+    }
+
     /// Removes an entry with the specified `key` from the map and returns it.
     ///
     /// The value will not actually be dropped until all references to it have gone
@@ -556,6 +591,47 @@ where
             s.get_or_insert(k, v);
         }
         s
+    }
+}
+
+/// A cursor for inserting a batch of keys in ascending order into a [`SkipMap`], made by
+/// [`SkipMap::with_finger`] (SlateDB fork).
+pub struct Finger<'g, K, V> {
+    inner: base::Finger<'g, K, V>,
+}
+
+impl<K, V> Finger<'_, K, V>
+where
+    K: Ord + Send + 'static,
+    V: Send + 'static,
+{
+    /// Inserts `key` and `value` as [`SkipMap::insert`] does, replacing an entry with an equal
+    /// key.
+    pub fn insert(&mut self, key: K, value: V) {
+        self.compare_insert(key, value, |_| true);
+    }
+
+    /// Inserts `key` and `value` as [`SkipMap::compare_insert`] does: an entry with an equal key
+    /// is replaced if `compare_fn` returns `true` for its value.
+    pub fn compare_insert<F>(&mut self, key: K, value: V, compare_fn: F)
+    where
+        F: Fn(&V) -> bool,
+    {
+        let guard = self.inner.guard();
+        self.inner
+            .compare_insert(key, value, compare_fn)
+            .release(guard);
+    }
+
+    /// How this finger's inserts have searched so far.
+    pub fn stats(&self) -> FingerStats {
+        self.inner.stats()
+    }
+}
+
+impl<K, V> fmt::Debug for Finger<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.inner, f)
     }
 }
 

@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(test)]
+use crossbeam_skiplist::map::FingerStats;
 use crossbeam_skiplist::map::Range;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
@@ -110,6 +112,39 @@ pub(crate) struct KVTable {
     /// paths after the antichain check. Empty when no extractor is
     /// configured.
     touched_segments: Mutex<std::collections::BTreeSet<Bytes>>,
+    /// Debug builds: the `put` and `put_sorted` calls in progress, which must be at most one (see
+    /// [`KVTable::put_sorted`]).
+    #[cfg(debug_assertions)]
+    writers: AtomicUsize,
+    /// Tests: how this table's inserts went (see [`InsertCounts`]).
+    #[cfg(test)]
+    insert_counts: Mutex<InsertCounts>,
+}
+
+/// Tests: how a table's inserts went.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InsertCounts {
+    /// Inserts that replaced an entry with an equal (key, seq), which removes the old node.
+    pub(crate) replaced: usize,
+    /// The finger statistics of every `put_sorted`, summed.
+    pub(crate) finger: FingerStats,
+}
+
+/// Held by a `put` or `put_sorted` while it inserts. Debug builds check that a table has at most
+/// one at a time.
+struct WriterToken<'a> {
+    #[cfg(debug_assertions)]
+    writers: &'a AtomicUsize,
+    #[cfg(not(debug_assertions))]
+    _table: std::marker::PhantomData<&'a ()>,
+}
+
+impl Drop for WriterToken<'_> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        self.writers.fetch_sub(1, SeqCst);
+    }
 }
 
 pub(crate) struct KVTableMetadata {
@@ -142,6 +177,11 @@ impl WritableKVTable {
 
     pub(crate) fn put(&self, row: RowEntry) {
         self.table.put(row);
+    }
+
+    /// Delegate to [`KVTable::put_sorted`].
+    pub(crate) fn put_sorted(&self, rows: impl IntoIterator<Item = RowEntry>) {
+        self.table.put_sorted(rows);
     }
 
     pub(crate) fn metadata(&self) -> KVTableMetadata {
@@ -406,6 +446,10 @@ impl KVTable {
             first_seq: AtomicU64::new(u64::MAX),
             sequence_tracker: Mutex::new(SequenceTracker::new()),
             touched_segments: Mutex::new(std::collections::BTreeSet::new()),
+            #[cfg(debug_assertions)]
+            writers: AtomicUsize::new(0),
+            #[cfg(test)]
+            insert_counts: Mutex::new(InsertCounts::default()),
         }
     }
 
@@ -560,9 +604,115 @@ impl KVTable {
     }
 
     pub(crate) fn put(&self, row: RowEntry) {
-        let internal_key = SequencedKey::new(row.key.clone(), row.seq);
+        let _writer = self.enter_writer();
+        let (internal_key, row_size) = self.record_row(&row);
         let previous_size = Cell::new(None);
+        self.map.compare_insert(internal_key, row, |previous_row| {
+            // Optimistically calculate the size of the previous value.
+            // `compare_fn` might be called multiple times in case of concurrent
+            // writes to the same key, so we use `Cell` to avoid subtracting
+            // the size multiple times. The last call will set the correct size.
+            previous_size.set(Some(previous_row.estimated_size()));
+            true
+        });
+        self.account_insert(row_size, previous_size.take());
+    }
 
+    /// Inserts `rows` as [`put`](Self::put) does, one at a time, but starts the skip-list search
+    /// for each row where the previous row's insert linked its node (a finger), not at the head.
+    /// The write path calls it with a write batch, whose rows are in ascending key order with one
+    /// sequence number. The search for each row then starts near the previous row's position.
+    ///
+    /// Rows need not be sorted. A row at or below the previous row in `SequencedKey` order
+    /// (out of order, or an equal key and sequence number) is searched for from the head, and is
+    /// inserted exactly as `put` inserts it.
+    ///
+    /// # Why the finger is never stale here
+    ///
+    /// The skip list's finger is correct with any concurrent readers, writers and removals (see
+    /// `crossbeam_skiplist::base::Finger`): a removed node it holds sends the insert back to the
+    /// head. This table also keeps the finger from ever needing that fallback:
+    ///
+    /// - One writer. Every row written to a mutable memtable comes from the batch writer task
+    ///   (`write_entries_to_memtable`), under the state read lock, so a freeze (write lock)
+    ///   cannot happen while a batch is inserted. WAL replay and `filter_after_seq` write to a
+    ///   new table before any reader or writer can see it. Debug builds check that a table has at
+    ///   most one `put` or `put_sorted` in progress.
+    /// - No removals. Nothing removes from the map: the only mutation is `compare_insert`. Its
+    ///   replace path removes the old node only for an equal (key, seq). A write batch has unique
+    ///   keys and one sequence number, and every batch has a new, higher sequence number. If an
+    ///   equal (key, seq) still came, the replace runs on a head search, which unlinks the old
+    ///   node before the insert returns.
+    /// - Readers unlink only nodes that are marked as removed, so with no removals they change
+    ///   nothing.
+    /// - The finger lives for one call, under one pinned epoch guard, so the nodes it holds
+    ///   cannot be freed while it is used.
+    ///
+    /// A stale finger is handled in two places. The skip list always falls back to a head search,
+    /// because it must stay correct for any caller. Here, debug builds also assert that no insert
+    /// fell back for that reason: in this table it can only mean a broken invariant (a second
+    /// writer or a removal), which tests must catch. Release builds keep the correct fallback.
+    pub(crate) fn put_sorted(&self, rows: impl IntoIterator<Item = RowEntry>) {
+        let _writer = self.enter_writer();
+        let stats = self.map.with_finger(|finger| {
+            for row in rows {
+                let (internal_key, row_size) = self.record_row(&row);
+                let previous_size = Cell::new(None);
+                finger.compare_insert(internal_key, row, |previous_row| {
+                    // As in `put`: the last call sets the size of the row replaced.
+                    previous_size.set(Some(previous_row.estimated_size()));
+                    true
+                });
+                self.account_insert(row_size, previous_size.take());
+            }
+            finger.stats()
+        });
+        debug_assert_eq!(
+            stats.stale, 0,
+            "a memtable insert met a removed node: the memtable has one writer and no removals"
+        );
+        #[cfg(test)]
+        {
+            let mut counts = self.insert_counts.lock();
+            counts.finger.from_finger += stats.from_finger;
+            counts.finger.empty += stats.empty;
+            counts.finger.out_of_order += stats.out_of_order;
+            counts.finger.stale += stats.stale;
+        }
+    }
+
+    /// Tests: how this table's inserts went.
+    #[cfg(test)]
+    pub(crate) fn insert_counts(&self) -> InsertCounts {
+        *self.insert_counts.lock()
+    }
+
+    /// Marks a `put` or `put_sorted` in progress until the token is dropped. Debug builds panic if
+    /// another one is in progress: a memtable has one writer.
+    #[cfg(debug_assertions)]
+    fn enter_writer(&self) -> WriterToken<'_> {
+        let others = self.writers.fetch_add(1, SeqCst);
+        // The token exists before the assert, so a panic here still undoes the `fetch_add`.
+        let token = WriterToken {
+            writers: &self.writers,
+        };
+        assert_eq!(
+            others, 0,
+            "a second writer entered a memtable while another was writing to it"
+        );
+        token
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn enter_writer(&self) -> WriterToken<'_> {
+        WriterToken {
+            _table: std::marker::PhantomData,
+        }
+    }
+
+    /// Updates the table's ticks and sequence numbers for `row`, and returns its internal key
+    /// and estimated size.
+    fn record_row(&self, row: &RowEntry) -> (SequencedKey, usize) {
         // it is safe to use fetch_max here to update the last tick
         // because the monotonicity is enforced when generating the clock tick
         // (see [crate::utils::MonotonicClock::now])
@@ -573,25 +723,24 @@ impl KVTable {
         self.last_seq.fetch_max(row.seq, SeqCst);
         // update the first seq number if it is smaller than the current first seq
         self.first_seq.fetch_min(row.seq, SeqCst);
+        (
+            SequencedKey::new(row.key.clone(), row.seq),
+            row.estimated_size(),
+        )
+    }
 
-        let row_size = row.estimated_size();
-        self.map.compare_insert(internal_key, row, |previous_row| {
-            // Optimistically calculate the size of the previous value.
-            // `compare_fn` might be called multiple times in case of concurrent
-            // writes to the same key, so we use `Cell` to avoid subtracting
-            // the size multiple times. The last call will set the correct size.
-            previous_size.set(Some(previous_row.estimated_size()));
-            true
-        });
-        if let Some(size) = previous_size.take() {
+    /// Adds an inserted row's size, less the size of the row it replaced, if any.
+    fn account_insert(&self, row_size: usize, replaced_size: Option<usize>) {
+        if let Some(size) = replaced_size {
             self.entries_size_in_bytes
                 .fetch_sub(size, Ordering::Relaxed);
-            self.entries_size_in_bytes
-                .fetch_add(row_size, Ordering::Relaxed);
-        } else {
-            self.entries_size_in_bytes
-                .fetch_add(row_size, Ordering::Relaxed);
+            #[cfg(test)]
+            {
+                self.insert_counts.lock().replaced += 1;
+            }
         }
+        self.entries_size_in_bytes
+            .fetch_add(row_size, Ordering::Relaxed);
     }
 
     pub(crate) fn durable_watcher(&self) -> WatchableOnceCellReader<Result<(), SlateDBError>> {
@@ -609,6 +758,52 @@ impl KVTable {
 
     pub(crate) fn sequence_tracker_snapshot(&self) -> SequenceTracker {
         self.sequence_tracker.lock().clone()
+    }
+}
+
+#[cfg(feature = "bench-internal")]
+pub mod benches {
+    //! A memtable for `benches/memtable_put_sorted.rs`.
+
+    use super::KVTable;
+    use crate::types::{RowEntry, ValueDeletable};
+    use bytes::Bytes;
+
+    /// A memtable (`KVTable`) with its two insert paths.
+    pub struct Memtable(KVTable);
+
+    impl Default for Memtable {
+        fn default() -> Self {
+            Self(KVTable::new())
+        }
+    }
+
+    impl Memtable {
+        /// Inserts one row, searching from the skip list's head (`KVTable::put`).
+        pub fn put(&self, key: Bytes, value: Bytes, seq: u64) {
+            self.0.put(row(key, value, seq));
+        }
+
+        /// Inserts a batch's rows, each search starting from the previous insert
+        /// (`KVTable::put_sorted`).
+        pub fn put_sorted(&self, rows: impl IntoIterator<Item = (Bytes, Bytes)>, seq: u64) {
+            self.0
+                .put_sorted(rows.into_iter().map(|(key, value)| row(key, value, seq)));
+        }
+
+        /// The number of entries.
+        pub fn len(&self) -> usize {
+            self.0.metadata().entry_num
+        }
+
+        /// True if the memtable has no entries.
+        pub fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+    }
+
+    fn row(key: Bytes, value: Bytes, seq: u64) -> RowEntry {
+        RowEntry::new(key, ValueDeletable::Value(value), seq, None, None)
     }
 }
 
@@ -1257,6 +1452,375 @@ mod tests {
         .await;
     }
 
+    /// A small deterministic generator (xorshift64*), for the `put_sorted` tests.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn all_rows(table: &KVTable) -> Vec<RowEntry> {
+        let mut iter = table.iter();
+        let mut rows = Vec::new();
+        while let Some(row) = iter.next_sync() {
+            rows.push(row);
+        }
+        rows
+    }
+
+    fn scan(table: &KVTable, range: BytesRange, ordering: IterationOrder) -> Vec<RowEntry> {
+        let mut iter = table.range(range, ordering, ReadTrace::none());
+        let mut rows = Vec::new();
+        while let Some(row) = iter.next_sync() {
+            rows.push(row);
+        }
+        rows
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum BatchShape {
+        /// Keys spread over 256 buckets, sorted, as a write batch hands them over.
+        Spread,
+        /// Keys at a time-ordered tail, sorted.
+        Clustered,
+        /// Spread keys, sorted, with some rows repeated with the same (key, seq).
+        EqualKeys,
+        /// Spread keys in random order.
+        Unsorted,
+    }
+
+    /// `count` batches of the given shapes. Batch `b` has sequence number `b + 1`. Keys repeat
+    /// across batches (with different sequence numbers).
+    fn random_batches(
+        rng: &mut XorShift,
+        count: usize,
+        shapes: &[BatchShape],
+    ) -> Vec<Vec<RowEntry>> {
+        let mut tail = 0u64;
+        (0..count)
+            .map(|b| {
+                let seq = b as u64 + 1;
+                let shape = shapes[b % shapes.len()];
+                let len = 1 + rng.below(48) as usize;
+                let mut keys: Vec<Vec<u8>> = (0..len)
+                    .map(|_| match shape {
+                        BatchShape::Clustered => {
+                            tail += 1 + rng.below(3);
+                            let mut key = vec![1u8];
+                            key.extend_from_slice(&tail.to_be_bytes());
+                            key
+                        }
+                        _ => {
+                            let mut key = vec![2u8, rng.below(256) as u8];
+                            key.extend_from_slice(&rng.below(400).to_be_bytes());
+                            key
+                        }
+                    })
+                    .collect();
+                keys.sort();
+                keys.dedup();
+                let mut rows: Vec<RowEntry> = keys
+                    .iter()
+                    .enumerate()
+                    .map(|(at, key)| RowEntry::new_value(key, format!("b{b}-{at}").as_bytes(), seq))
+                    .collect();
+                match shape {
+                    BatchShape::EqualKeys => {
+                        // Repeat about a quarter of the rows right after themselves.
+                        let mut with_equal = Vec::new();
+                        for row in rows {
+                            let repeat = rng.below(4) == 0;
+                            with_equal.push(row.clone());
+                            if repeat {
+                                with_equal.push(RowEntry::new_value(&row.key, b"again", seq));
+                            }
+                        }
+                        rows = with_equal;
+                    }
+                    BatchShape::Unsorted => {
+                        for at in (1..rows.len()).rev() {
+                            rows.swap(at, rng.below(at as u64 + 1) as usize);
+                        }
+                    }
+                    BatchShape::Spread | BatchShape::Clustered => {}
+                }
+                rows
+            })
+            .collect()
+    }
+
+    #[test]
+    fn should_put_sorted_the_same_table_as_put() {
+        // given
+        let rows = vec![
+            RowEntry::new_value(b"k1", b"a", 3),
+            RowEntry::new_value(b"k2", b"b", 3),
+            RowEntry::new_value(b"k2", b"c", 3),
+            RowEntry::new_tombstone(b"k3", 3),
+            RowEntry::new_value(b"k0", b"d", 3),
+            RowEntry::new_merge(b"k4", b"e", 3),
+        ];
+        let by_put = KVTable::new();
+        let by_put_sorted = KVTable::new();
+
+        // when
+        for row in rows.clone() {
+            by_put.put(row);
+        }
+        by_put_sorted.put_sorted(rows);
+
+        // then
+        assert_eq!(all_rows(&by_put_sorted), all_rows(&by_put));
+        let (a, b) = (by_put.metadata(), by_put_sorted.metadata());
+        assert_eq!(
+            (
+                a.entry_num,
+                a.entries_size_in_bytes,
+                a.last_seq,
+                a.first_seq
+            ),
+            (
+                b.entry_num,
+                b.entries_size_in_bytes,
+                b.last_seq,
+                b.first_seq
+            )
+        );
+        // The equal (k2, 3) replaced one row on both paths; it and k0 searched from the head.
+        assert_eq!(by_put.insert_counts().replaced, 1);
+        assert_eq!(
+            by_put_sorted.insert_counts(),
+            InsertCounts {
+                replaced: 1,
+                finger: FingerStats {
+                    from_finger: 3,
+                    empty: 1,
+                    out_of_order: 2,
+                    stale: 0,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn should_put_sorted_into_an_empty_table_and_after_existing_rows() {
+        let table = KVTable::new();
+        table.put_sorted(Vec::new());
+        assert!(table.is_empty());
+
+        table.put_sorted(
+            (0..1_000u32).map(|i| RowEntry::new_value(&(i * 2).to_be_bytes(), b"even", 1)),
+        );
+        table.put_sorted(
+            (0..1_000u32).map(|i| RowEntry::new_value(&(i * 2 + 1).to_be_bytes(), b"odd", 2)),
+        );
+
+        let rows = all_rows(&table);
+        assert_eq!(rows.len(), 2_000);
+        for (at, row) in rows.iter().enumerate() {
+            assert_eq!(row.key, Bytes::copy_from_slice(&(at as u32).to_be_bytes()));
+        }
+        let counts = table.insert_counts();
+        assert_eq!(counts.finger.from_finger, 1_998);
+        assert_eq!(counts.finger.empty, 2);
+        assert_eq!(counts.finger.out_of_order + counts.finger.stale, 0);
+    }
+
+    /// The single-writer invariant is checked: a second `put` while a `put_sorted` is inserting
+    /// panics in debug builds.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a second writer entered a memtable")]
+    fn should_panic_when_a_second_writer_enters_during_put_sorted() {
+        let table = KVTable::new();
+        let rows = (0..4u8).map(|i| {
+            if i == 2 {
+                table.put(RowEntry::new_value(b"other", b"v", 9));
+            }
+            RowEntry::new_value(&[i], b"v", 1)
+        });
+        table.put_sorted(rows);
+    }
+
+    /// `put_sorted` with readers scanning and reading the table while it inserts gives the same
+    /// table and the same scans as `put` one row at a time. Readers check, while the batches go
+    /// in, that every scan is in order and holds every row of each batch already inserted. The
+    /// writer waits for a reader's scan every `PACE` batches, so scans overlap the inserts.
+    #[test]
+    fn should_put_sorted_with_concurrent_readers_like_put() {
+        const BATCHES: usize = 1_000;
+        const READERS: usize = 4;
+        const PACE: usize = 10;
+        let shape_sets: [&[BatchShape]; 3] = [
+            &[BatchShape::Spread],
+            &[BatchShape::Clustered, BatchShape::Spread],
+            &[
+                BatchShape::Spread,
+                BatchShape::EqualKeys,
+                BatchShape::Unsorted,
+                BatchShape::Clustered,
+            ],
+        ];
+        for (case, shapes) in shape_sets.into_iter().enumerate() {
+            let mut rng = XorShift(0x9E37_79B9_7F4A_7C15 + case as u64);
+            let batches = random_batches(&mut rng, BATCHES, shapes);
+
+            // The (key, seq) pairs of batches 0..b, for b = 0..=BATCHES.
+            let mut distinct = std::collections::BTreeSet::new();
+            let mut present_after = vec![0usize];
+            for batch in &batches {
+                for row in batch {
+                    distinct.insert((row.key.clone(), row.seq));
+                }
+                present_after.push(distinct.len());
+            }
+
+            let by_put = KVTable::new();
+            for batch in &batches {
+                for row in batch.clone() {
+                    by_put.put(row);
+                }
+            }
+
+            let by_put_sorted = KVTable::new();
+            let inserted = AtomicUsize::new(0);
+            // Scans that started with 0 < done < BATCHES.
+            let scans_during_inserts = AtomicUsize::new(0);
+            // The `done` of the last scan that started during the inserts.
+            let last_scan_at = AtomicUsize::new(0);
+            // Readers still running. The writer stops waiting for scans when one has failed.
+            let readers_running = AtomicUsize::new(READERS);
+            let start = std::sync::Barrier::new(READERS + 1);
+            std::thread::scope(|scope| {
+                for reader in 0..READERS {
+                    let (table, inserted, batches) = (&by_put_sorted, &inserted, &batches);
+                    let (present_after, start) = (&present_after, &start);
+                    let (scans_during_inserts, last_scan_at) =
+                        (&scans_during_inserts, &last_scan_at);
+                    let readers_running = &readers_running;
+                    scope.spawn(move || {
+                        struct Running<'a>(&'a AtomicUsize);
+                        impl Drop for Running<'_> {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, SeqCst);
+                            }
+                        }
+                        let _running = Running(readers_running);
+                        let mut rng = XorShift(reader as u64 + 1);
+                        start.wait();
+                        loop {
+                            let done = inserted.load(SeqCst);
+                            if 0 < done && done < BATCHES {
+                                scans_during_inserts.fetch_add(1, SeqCst);
+                                last_scan_at.store(done, SeqCst);
+                            }
+                            // A full scan: in order, and every row of batches 0..done is there.
+                            let rows = all_rows(table);
+                            for pair in rows.windows(2) {
+                                let a = SequencedKey::new(pair[0].key.clone(), pair[0].seq);
+                                let b = SequencedKey::new(pair[1].key.clone(), pair[1].seq);
+                                assert!(a < b, "a scan out of order: {a:?} then {b:?}");
+                            }
+                            let old = rows.iter().filter(|row| row.seq <= done as u64).count();
+                            assert_eq!(old, present_after[done], "a scan missed a row");
+                            // Point reads of rows already inserted.
+                            if done > 0 {
+                                for _ in 0..8 {
+                                    let batch = &batches[rng.below(done as u64) as usize];
+                                    let row = &batch[rng.below(batch.len() as u64) as usize];
+                                    let found = scan(
+                                        table,
+                                        BytesRange::from(row.key.clone()..=row.key.clone()),
+                                        IterationOrder::Ascending,
+                                    );
+                                    assert!(
+                                        found.iter().any(|r| r.seq == row.seq),
+                                        "a read missed a row"
+                                    );
+                                }
+                            }
+                            if done == BATCHES {
+                                break;
+                            }
+                        }
+                    });
+                }
+                start.wait();
+                for (b, batch) in batches.iter().enumerate() {
+                    // Every PACE batches, wait until a scan has started at this point.
+                    if b > 0 && b % PACE == 0 {
+                        while last_scan_at.load(SeqCst) != b
+                            && readers_running.load(SeqCst) == READERS
+                        {
+                            std::thread::yield_now();
+                        }
+                    }
+                    by_put_sorted.put_sorted(batch.clone());
+                    inserted.fetch_add(1, SeqCst);
+                }
+            });
+            // A scan started at each of the BATCHES / PACE - 1 pauses at least.
+            assert!(
+                scans_during_inserts.load(SeqCst) >= BATCHES / PACE - 1,
+                "case {case}: {} scans during the inserts",
+                scans_during_inserts.load(SeqCst)
+            );
+
+            // The same rows, sizes and sequence numbers.
+            assert_eq!(all_rows(&by_put_sorted), all_rows(&by_put), "case {case}");
+            let (a, b) = (by_put.metadata(), by_put_sorted.metadata());
+            assert_eq!(
+                (
+                    a.entry_num,
+                    a.entries_size_in_bytes,
+                    a.last_seq,
+                    a.first_seq
+                ),
+                (
+                    b.entry_num,
+                    b.entries_size_in_bytes,
+                    b.last_seq,
+                    b.first_seq
+                ),
+                "case {case}"
+            );
+            // The same scans over random ranges, both ways.
+            for _ in 0..100 {
+                let mut bound = || {
+                    let mut key = vec![1 + rng.below(2) as u8, rng.below(256) as u8];
+                    key.extend_from_slice(&rng.below(400).to_be_bytes());
+                    Bytes::from(key)
+                };
+                let (x, y) = (bound(), bound());
+                let range = BytesRange::from(x.clone().min(y.clone())..=x.max(y));
+                for ordering in [IterationOrder::Ascending, IterationOrder::Descending] {
+                    assert_eq!(
+                        scan(&by_put_sorted, range.clone(), ordering),
+                        scan(&by_put, range.clone(), ordering),
+                        "case {case}"
+                    );
+                }
+            }
+            let counts = by_put_sorted.insert_counts();
+            assert_eq!(
+                counts.replaced,
+                by_put.insert_counts().replaced,
+                "case {case}"
+            );
+            assert_eq!(counts.finger.stale, 0, "case {case}");
+            assert!(counts.finger.from_finger > 0, "case {case}");
+        }
+    }
+
     #[tokio::test]
     async fn test_memtable_descending_seek_is_not_supported() {
         let table = seek_test_table();
@@ -1270,5 +1834,123 @@ mod tests {
             result,
             Err(SlateDBError::SeekNotSupportedForDescendingScan)
         ));
+    }
+}
+
+/// The stale-finger tests of the vendored `crossbeam-skiplist` (`tests/finger.rs`), copied here
+/// so that the workspace's test runs cover them. The vendored crate is outside the workspace.
+#[cfg(test)]
+mod skiplist_finger_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crossbeam_skiplist::map::FingerStats;
+    use crossbeam_skiplist::SkipMap;
+
+    fn contents(map: &SkipMap<u64, u64>) -> Vec<(u64, u64)> {
+        map.iter().map(|e| (*e.key(), *e.value())).collect()
+    }
+
+    #[test]
+    fn removed_finger_node_falls_back_to_the_head() {
+        let map = SkipMap::new();
+        let stats = map.with_finger(|finger| {
+            finger.insert(10, 100);
+            finger.insert(20, 200);
+            // The node the finger holds is removed under it.
+            assert!(map.remove(&20).is_some());
+            finger.insert(30, 300);
+            finger.insert(40, 400);
+            finger.stats()
+        });
+        assert_eq!(
+            stats,
+            FingerStats {
+                from_finger: 2,
+                empty: 1,
+                out_of_order: 0,
+                stale: 1,
+            }
+        );
+        assert_eq!(contents(&map), vec![(10, 100), (30, 300), (40, 400)]);
+    }
+
+    #[test]
+    fn removed_predecessors_fall_back_or_are_unlinked() {
+        // Every node the finger inserted is removed under it; the inserts after stay correct.
+        // Key 1 stays, so the list is not empty (a search of an empty list reads no finger node).
+        let map = SkipMap::new();
+        map.insert(1, 0);
+        let keys: Vec<u64> = (0..1_000).map(|k| k * 2).collect();
+        let stats = map.with_finger(|finger| {
+            for &key in &keys {
+                finger.insert(key, key * 10);
+            }
+            for &key in &keys {
+                assert!(map.remove(&key).is_some());
+            }
+            for key in 0..1_000 {
+                finger.insert(2_000 + key, key);
+            }
+            finger.stats()
+        });
+        assert_eq!(stats.stale, 1);
+        assert_eq!(map.len(), 1_001);
+        let keys: Vec<u64> = map.iter().map(|e| *e.key()).collect();
+        assert_eq!(
+            keys,
+            [1].into_iter().chain(2_000..3_000).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn concurrent_fingers_removals_and_readers() {
+        // Keys 3k start in the map and are removed by one thread. Keys 3k + 1 are inserted by a
+        // finger in ascending batches, and keys 3k + 2 by a second finger, while readers scan.
+        const N: u64 = 200_000;
+        let map = SkipMap::new();
+        for k in 0..N {
+            map.insert(3 * k, 0);
+        }
+        // Writers that have finished; the readers stop when all three have.
+        let done = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for residue in [1, 2] {
+                let (map, done) = (&map, &done);
+                s.spawn(move || {
+                    for batch in 0..N / 100 {
+                        map.with_finger(|finger| {
+                            for k in batch * 100..(batch + 1) * 100 {
+                                finger.insert(3 * k + residue, 3 * k + residue);
+                            }
+                        });
+                    }
+                    done.fetch_add(1, Ordering::Release);
+                });
+            }
+            s.spawn(|| {
+                for k in 0..N {
+                    map.remove(&(3 * k));
+                }
+                done.fetch_add(1, Ordering::Release);
+            });
+            for _ in 0..2 {
+                s.spawn(|| {
+                    while done.load(Ordering::Acquire) < 3 {
+                        let mut previous = None;
+                        for entry in map.iter() {
+                            let key = *entry.key();
+                            assert!(previous < Some(key), "a scan out of order");
+                            previous = Some(key);
+                        }
+                    }
+                });
+            }
+        });
+        let keys: Vec<u64> = map.iter().map(|e| *e.key()).collect();
+        let expected: Vec<u64> = (0..3 * N).filter(|k| k % 3 != 0).collect();
+        assert_eq!(keys, expected);
+        for entry in map.iter() {
+            assert_eq!(entry.key(), entry.value());
+        }
     }
 }

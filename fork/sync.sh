@@ -19,4 +19,6 @@ git rebase -q --onto main "$old_main" streams
 echo "patches now carried (empty ones were dropped by the rebase):"
 git log --oneline main..streams
 cargo test -p slatedb --lib --features zstd,wal_disable
+# The vendored crossbeam-skiplist is outside the workspace; run its own tests too.
+cargo test --release --manifest-path vendor/crossbeam-skiplist/Cargo.toml
 echo "SYNC_OK: push main and streams, tag streams-$(date -u +%Y%m%d)-$(git rev-parse --short streams), then measure in Streams before moving its pin."

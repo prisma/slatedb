@@ -145,6 +145,8 @@ mod incremental_progress;
 mod instrumented_object_store;
 mod iter;
 mod mem_table;
+#[cfg(feature = "bench-internal")]
+pub use mem_table::benches as memtable_benches;
 mod memtable_flusher;
 mod merge_iterator;
 mod merge_operator;
