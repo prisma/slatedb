@@ -1,7 +1,7 @@
 //! Tests of `SkipMap::with_finger` (SlateDB fork).
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crossbeam_skiplist::map::FingerStats;
 use crossbeam_skiplist::SkipMap;
@@ -270,5 +270,84 @@ fn concurrent_fingers_removals_and_readers() {
     assert_eq!(keys, expected);
     for entry in map.iter() {
         assert_eq!(entry.key(), entry.value());
+    }
+}
+
+#[test]
+fn concurrent_removals_of_the_fingers_own_nodes() {
+    // One finger inserts ascending keys. A second thread removes the newest node, which is most
+    // often the node the finger holds, and on alternate passes the node below it. Readers scan
+    // all the time. A round counts only if a search from the finger met a removed node.
+    const N: u64 = 50_000;
+    // Stops the other threads when the finger is done, also if it panics.
+    struct Done<'a>(&'a AtomicBool);
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    for round in 0..50 {
+        let map = SkipMap::new();
+        map.insert(0u64, 0u64);
+        let inserting = AtomicBool::new(true);
+        let (stats, removed) = std::thread::scope(|s| {
+            let remover = s.spawn(|| {
+                let mut removed = Vec::new();
+                let mut below = false;
+                while inserting.load(Ordering::Acquire) {
+                    if let Some(newest) = map.back() {
+                        let entry = if below { newest.prev() } else { Some(newest) };
+                        below = !below;
+                        if let Some(entry) = entry {
+                            let key = *entry.key();
+                            if key != 0 && entry.remove() {
+                                removed.push(key);
+                            }
+                        }
+                    }
+                }
+                removed
+            });
+            for _ in 0..2 {
+                s.spawn(|| {
+                    while inserting.load(Ordering::Acquire) {
+                        let mut previous = None;
+                        for entry in map.iter() {
+                            let key = *entry.key();
+                            assert!(previous < Some(key), "a scan out of order");
+                            previous = Some(key);
+                        }
+                    }
+                });
+            }
+            let stats = {
+                let _done = Done(&inserting);
+                map.with_finger(|finger| {
+                    for key in 1..=N {
+                        finger.insert(key, key);
+                    }
+                    finger.stats()
+                })
+            };
+            (stats, remover.join().unwrap())
+        });
+        // The first insert finds the finger empty; every later key is above the previous one.
+        assert_eq!((stats.empty, stats.out_of_order), (1, 0));
+        assert_eq!(stats.from_finger + stats.stale, N - 1);
+        let removed_set: std::collections::BTreeSet<u64> = removed.iter().copied().collect();
+        assert_eq!(removed_set.len(), removed.len(), "a key removed twice");
+        let keys: Vec<u64> = map.iter().map(|e| *e.key()).collect();
+        let expected: Vec<u64> = (0..=N).filter(|k| !removed_set.contains(k)).collect();
+        assert_eq!(keys, expected);
+        for entry in map.iter() {
+            assert_eq!(entry.key(), entry.value());
+        }
+        if stats.stale > 0 {
+            return;
+        }
+        assert!(
+            round < 49,
+            "no round's search from the finger met a removed node"
+        );
     }
 }

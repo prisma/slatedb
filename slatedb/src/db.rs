@@ -6831,6 +6831,62 @@ mod tests {
         db.close().await.unwrap();
     }
 
+    // The paused upload blocks a worker thread, so this test needs the multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_request_wal_flush_includes_a_write_applied_before_the_flush_tasks_turn() {
+        // Removes the fail point also on a panic, so that no worker stays blocked.
+        struct Unpause(Arc<FailPointRegistry>);
+        impl Drop for Unpause {
+            fn drop(&mut self) {
+                fail_parallel::remove(self.0.clone(), "write-wal-sst-io-error");
+            }
+        }
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        let db = Db::builder(
+            "/tmp/test_request_wal_flush_includes_a_write_applied_before_the_flush_tasks_turn",
+            object_store,
+        )
+        .with_settings(Settings {
+            flush_interval: None,
+            compactor_options: None,
+            garbage_collector_options: None,
+            ..Settings::default()
+        })
+        .with_fp_registry(fp_registry.clone())
+        .build()
+        .await
+        .unwrap();
+        let first_wal_id = db.inner.wal_observer.status().unwrap().last_flushed_wal_id;
+        // The flush task uploads inline. A paused upload holds the task before its next turn.
+        fail_parallel::cfg(fp_registry.clone(), "write-wal-sst-io-error", "pause").unwrap();
+        let unpause = Unpause(fp_registry);
+        db.put(b"first", b"v1").await.unwrap();
+        db.request_wal_flush().await.unwrap();
+        db.request_wal_flush().await.unwrap();
+        // Applied after both requests, and before the second request's turn.
+        let last = db.put(b"last", b"v2").await.unwrap();
+        drop(unpause);
+
+        // The second request freezes the WAL at its turn, so it makes `last` durable. A request
+        // that froze the WAL when it was made would leave `last` buffered: no timer runs here.
+        let mut status = db.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            status.wait_for(|s| s.durable_seq >= last.seqnum()),
+        )
+        .await
+        .expect("a write applied before the flush task's turn did not become durable")
+        .unwrap();
+        let wal_objects =
+            db.inner.wal_observer.status().unwrap().last_flushed_wal_id - first_wal_id;
+        assert!(
+            (1..=2).contains(&wal_objects),
+            "two requests wrote {wal_objects} WAL objects"
+        );
+        db.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_manifest_writes_sample_flushed_wal_id() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
