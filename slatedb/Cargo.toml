@@ -176,6 +176,10 @@ name = "memtable_put_sorted"
 harness = false
 required-features = ["bench-internal"]
 
+[[bench]]
+name = "memtable_by_prefix"
+harness = false
+
 [lints]
 workspace = true
 
