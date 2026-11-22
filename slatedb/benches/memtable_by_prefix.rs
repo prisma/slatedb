@@ -1,5 +1,6 @@
 //! Measures a memtable prototype with one skip list for each 2-byte key prefix. The question is
-//! whether it removes the extra insert cost of a bucket-first key layout.
+//! whether it removes the extra insert cost of a bucket-first key layout, and whether lists by
+//! key space make the clustered layout's inserts cheaper.
 //!
 //! The replay is slate-temporal's P2-11 memtable replay (its step 0b, corrected), copied here.
 //! A commit group holds 24 jobs. A job is one Workflow Task completion of one Workflow Id: 12
@@ -10,33 +11,43 @@
 //! into a `SkipMap<Vec<u8>, ()>`. The memtable starts again when it holds `entries` rows, as a
 //! flush does. Only the inserts are timed.
 //!
-//! Every variant uses plain `insert`, not the finger insert (`put_sorted`). This bench does not
-//! measure the prototype with a finger.
-//!
-//! Three variants:
+//! Eight variants: four memtables, each with two insert paths.
 //!
 //! - `v5`: the clustered layout. Keys lead with `01 <key space>`, and the timer and ready-index
 //!   keys are time-ordered, so a group's keys land at a few warm tails. One skip list.
 //! - `v6-256`: the bucket-first layout. Every key of a Workflow Id leads with `02 <bucket>`, the
 //!   bucket two bytes big-endian (the top 8 bits of the Workflow Id's hash, so 256 buckets).
 //!   One skip list.
-//! - `v6-256 by prefix`: the same keys in the prototype, [`ByPrefix`]. It has one skip list for
-//!   each value of the two bytes after a lead byte `02`, one list for the keys before them and
-//!   one for the keys after them. Iteration is the concatenation of the lists in key order.
+//! - `v6-256 by bucket`: the same keys in the prototype, [`ByPrefix`] with [`Bucket`]. It has one
+//!   skip list for each value of the two bytes after a lead byte `02`, one list for the keys
+//!   before them and one for the keys after them. Iteration is the concatenation of the lists in
+//!   key order.
+//! - `v5 by key space`: `v5`'s keys in the prototype with [`KeySpace`]: one skip list for each
+//!   value of the byte after a lead byte `01`, plus the two lists before and after.
 //!
-//! The bench also times a full iteration and a seek on a memtable full of `v6-256` keys, in one
-//! skip list and in the prototype.
+//! The insert paths:
+//!
+//! - plain: `SkipMap::insert` for each key. Each search starts at the list's head.
+//! - finger: patch 11's finger (`SkipMap::with_finger`), as `KVTable::put_sorted` uses it. One
+//!   finger for each list a group touches, and one epoch pin for the group.
+//!
+//! The bench also times a full iteration and a seek, in one skip list and in the prototype: on a
+//! memtable full of `v6-256` keys (by bucket), and on one full of `v5` keys (by key space).
 //!
 //! The prototype is only in this bench. It does not change the library.
 //!
 //! Run with: cargo bench -p slatedb --bench memtable_by_prefix
-//! Run it on a quiet host. It prints its figures and has no criterion report.
+//! Run it on a quiet host. It prints its figures and has no criterion report. Each replay runs in
+//! its own process (the bench runs its own executable again), after its own warm-up. With all
+//! variants in one process, plain `v5` read up to 40 ns slower in most replays. In separate
+//! processes it did not.
 //!
-//! Results on 2026-11-21 (23:17Z), Apple M4 Pro (14 cores), macOS 26.6.2, the bench profile (LTO),
-//! on a quiet host. Each figure is the mean of six replays of 20,000 commit groups, in ns per
-//! insert, with the spread (most less least) of the six. The excess is over `v5`'s mean.
+//! M-1, on 2026-11-21 (23:17Z), Apple M4 Pro (14 cores), macOS 26.6.2, the bench profile (LTO),
+//! on a quiet host, with plain inserts and the first three memtables only. Each figure is the
+//! mean of six replays of 20,000 commit groups, in ns per insert, with the spread (most less
+//! least) of the six. The excess is over `v5`'s mean.
 //!
-//! | memtable entries | `v5` | `v6-256` | `v6-256` by prefix |
+//! | memtable entries | `v5` | `v6-256` | `v6-256` by bucket |
 //! |---:|---:|---:|---:|
 //! | 50,000 | 198.3 (spread 4.8) | 226.5 (spread 6.4), +28.2 | 135.4 (spread 4.6), -62.9 |
 //! | 200,000 | 217.6 (spread 3.3) | 273.1 (spread 2.6), +55.5 | 186.7 (spread 1.0), -31.0 |
@@ -48,11 +59,31 @@
 //! | 50,133 | 7.00 against 7.07 (+1.0%) | 213.8 against 149.9 (-29.9%) |
 //! | 200,130 | 10.28 against 10.41 (+1.3%) | 283.7 against 206.8 (-27.1%) |
 //!
-//! The prototype's inserts are faster than `v5`'s in one list. Its lists are short: a full
-//! memtable holds about 195 or 780 entries in each of its 256 lists. This bench does not measure
-//! `v5` keys in lists by key space.
+//! M-2, on 2026-11-22 (01:53Z), the same host, each replay in its own process. ns per insert, the
+//! mean of six replays (spread), and the excess over `v5`'s mean with the same insert path:
+//!
+//! | memtable entries | insert | `v5` | `v6-256` | `v6-256` by bucket | `v5` by key space |
+//! |---:|---|---:|---:|---:|---:|
+//! | 50,000 | plain | 204.8 (7.7) | 232.2 (6.8), +27.4 | 137.5 (3.9), -67.4 | 183.6 (4.0), -21.2 |
+//! | 50,000 | finger | 170.0 (4.4) | 203.2 (3.3), +33.2 | 130.1 (1.3), -39.8 | 147.7 (3.6), -22.2 |
+//! | 200,000 | plain | 225.3 (1.8) | 283.6 (3.2), +58.3 | 189.9 (2.3), -35.4 | 201.3 (3.0), -24.0 |
+//! | 200,000 | finger | 188.8 (2.1) | 270.0 (5.3), +81.2 | 191.5 (3.0), +2.6 | 166.7 (2.2), -22.1 |
+//!
+//! A full iteration and a seek, one list against the prototype (means of six):
+//!
+//! | keys | memtable entries | iteration | seek |
+//! |---|---:|---:|---:|
+//! | `v6-256`, by bucket | 50,000 | 7.50 against 7.27 (-3.0%) | 213.4 against 160.3 (-24.9%) |
+//! | `v6-256`, by bucket | 200,000 | 11.41 against 11.55 (+1.2%) | 287.9 against 225.2 (-21.8%) |
+//! | `v5`, by key space | 50,000 | 7.30 against 7.06 (-3.4%) | 132.0 against 115.7 (-12.4%) |
+//! | `v5`, by key space | 200,000 | 8.20 against 7.80 (-5.0%) | 137.9 against 124.8 (-9.5%) |
+//!
+//! The finger gap between `v5` and `v6-256` here (+33.2 and +81.2 ns) is larger than in
+//! `memtable_put_sorted` (+3 and +40 ns). The benches differ: that one inserts `KVTable` rows
+//! with values and sequence numbers, with random Workflow Ids.
 
 use std::hint::black_box;
+use std::marker::PhantomData;
 use std::ops::Bound;
 #[allow(clippy::disallowed_types)]
 use std::time::{Duration, Instant};
@@ -230,6 +261,9 @@ impl Groups {
 /// A memtable under test.
 trait Table: Default {
     fn insert(&mut self, key: Vec<u8>);
+    /// Inserts a sorted group with patch 11's finger (`SkipMap::with_finger`), as
+    /// `KVTable::put_sorted` does: one finger for each list, each search from the previous insert.
+    fn insert_sorted(&mut self, batch: Vec<Vec<u8>>);
     fn len(&self) -> usize;
     /// Visits every key in order, and returns the number of keys.
     fn iterate(&self) -> usize;
@@ -244,6 +278,14 @@ struct OneList(SkipMap<Vec<u8>, ()>);
 impl Table for OneList {
     fn insert(&mut self, key: Vec<u8>) {
         self.0.insert(key, ());
+    }
+
+    fn insert_sorted(&mut self, batch: Vec<Vec<u8>>) {
+        self.0.with_finger(|finger| {
+            for key in batch {
+                finger.insert(key, ());
+            }
+        });
     }
 
     fn len(&self) -> usize {
@@ -269,57 +311,107 @@ impl Table for OneList {
 /// One skip list of the prototype.
 type List = SkipMap<Vec<u8>, ()>;
 
-/// The number of partitions: one before the `02` keys, one for each 2-byte prefix after `02`,
-/// one after the `02` keys.
-const PARTITIONS: usize = 1 + 65_536 + 1;
+/// How the prototype puts keys in lists. The partition of a key must go up with the key.
+trait Scheme {
+    const PARTITIONS: usize;
+    fn of(key: &[u8]) -> usize;
+}
 
-/// The prototype: one skip list for each 2-byte prefix after a lead byte `02`, one for the keys
-/// that sort before all `02` keys and one for the keys that sort after them. The partition of a
-/// key goes up with the key, so the concatenation of the lists in partition order is in key
-/// order. A list is made at its first insert. A real memtable must make it safely for
-/// concurrent writers, or make all lists before the first write.
-struct ByPrefix {
+/// v6's buckets: one list for each value of the two bytes after a lead byte `02`, one for the
+/// keys before them and one for the keys after them.
+struct Bucket;
+
+impl Scheme for Bucket {
+    const PARTITIONS: usize = 1 + 65_536 + 1;
+
+    /// A key `02` or `02 xx`, shorter than its prefix, goes to the lowest partition that agrees
+    /// with its bytes. It sorts before every other key there.
+    fn of(key: &[u8]) -> usize {
+        match key.first() {
+            None => 0,
+            Some(lead) if *lead < 2 => 0,
+            Some(2) => {
+                let hi = key.get(1).copied().unwrap_or(0) as usize;
+                let lo = key.get(2).copied().unwrap_or(0) as usize;
+                1 + (hi << 8 | lo)
+            }
+            Some(_) => Self::PARTITIONS - 1,
+        }
+    }
+}
+
+/// v5's key spaces: one list for each value of the byte after a lead byte `01` (a v5 key is
+/// `01 <key space> ...`), one for the keys before them and one for the keys after them.
+struct KeySpace;
+
+impl Scheme for KeySpace {
+    const PARTITIONS: usize = 1 + 256 + 1;
+
+    /// A key `01`, shorter than its prefix, goes to the lowest partition, as for [`Bucket`].
+    fn of(key: &[u8]) -> usize {
+        match key.first() {
+            None => 0,
+            Some(0) => 0,
+            Some(1) => 1 + key.get(1).copied().unwrap_or(0) as usize,
+            Some(_) => Self::PARTITIONS - 1,
+        }
+    }
+}
+
+/// The prototype: one skip list for each partition of a [`Scheme`]. The concatenation of the
+/// lists in partition order is in key order. A list is made at its first insert. A real memtable
+/// must make it safely for concurrent writers, or make all lists before the first write.
+struct ByPrefix<S> {
     lists: Vec<Option<Box<List>>>,
     /// The partitions that have a list, in ascending order.
     used: Vec<usize>,
+    scheme: PhantomData<S>,
 }
 
-impl Default for ByPrefix {
+impl<S: Scheme> Default for ByPrefix<S> {
     fn default() -> Self {
         ByPrefix {
-            lists: (0..PARTITIONS).map(|_| None).collect(),
+            lists: (0..S::PARTITIONS).map(|_| None).collect(),
             used: Vec::new(),
+            scheme: PhantomData,
         }
     }
 }
 
-/// The partition of `key`. A key `02` or `02 xx`, shorter than its prefix, goes to the lowest
-/// partition that agrees with its bytes. It sorts before every other key there.
-fn partition(key: &[u8]) -> usize {
-    match key.first() {
-        None => 0,
-        Some(lead) if *lead < 2 => 0,
-        Some(2) => {
-            let hi = key.get(1).copied().unwrap_or(0) as usize;
-            let lo = key.get(2).copied().unwrap_or(0) as usize;
-            1 + (hi << 8 | lo)
-        }
-        Some(_) => PARTITIONS - 1,
-    }
-}
-
-impl Table for ByPrefix {
-    fn insert(&mut self, key: Vec<u8>) {
-        let at = partition(&key);
-        let list = match &mut self.lists[at] {
+impl<S: Scheme> ByPrefix<S> {
+    /// The list of partition `at`, made if it has none.
+    fn list(&mut self, at: usize) -> &List {
+        match &mut self.lists[at] {
             Some(list) => list,
             slot @ None => {
                 let place = self.used.partition_point(|used| *used < at);
                 self.used.insert(place, at);
                 slot.insert(Box::default())
             }
-        };
-        list.insert(key, ());
+        }
+    }
+}
+
+impl<S: Scheme> Table for ByPrefix<S> {
+    fn insert(&mut self, key: Vec<u8>) {
+        let at = S::of(&key);
+        self.list(at).insert(key, ());
+    }
+
+    fn insert_sorted(&mut self, batch: Vec<Vec<u8>>) {
+        // One pin for the group, as one list has, so each list's own pin is a re-pin.
+        let _guard = crossbeam_epoch::pin();
+        // The group is sorted, so the keys of one list are next to each other.
+        let mut keys = batch.into_iter().peekable();
+        while let Some(first) = keys.next() {
+            let at = S::of(&first);
+            self.list(at).with_finger(|finger| {
+                finger.insert(first, ());
+                while let Some(key) = keys.next_if(|key| S::of(key) == at) {
+                    finger.insert(key, ());
+                }
+            });
+        }
     }
 
     fn len(&self) -> usize {
@@ -343,7 +435,7 @@ impl Table for ByPrefix {
     }
 
     fn seek(&self, target: &[u8]) -> Option<usize> {
-        let at = partition(target);
+        let at = S::of(target);
         if let Some(list) = &self.lists[at] {
             if let Some(entry) = list.lower_bound(Bound::Included(target)) {
                 return Some(entry.key().len());
@@ -359,22 +451,42 @@ impl Table for ByPrefix {
     }
 }
 
+/// How a replay inserts a group's keys.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Insert {
+    /// `SkipMap::insert` for each key: each search starts at the list's head.
+    Plain,
+    /// Patch 11's finger: [`Table::insert_sorted`].
+    Finger,
+}
+
 /// One replay of `groups` commit groups into a memtable of up to `entries` entries. Returns ns
 /// per insert.
-fn replay<T: Table>(layout: Layout, entries: usize, groups: usize) -> f64 {
+fn replay<T: Table>(layout: Layout, insert: Insert, entries: usize, groups: usize) -> f64 {
     let mut source = Groups::new(layout);
     let mut table = T::default();
     let mut inserts = 0u64;
     let mut took = Duration::ZERO;
     for _ in 0..groups {
         let batch = source.next_group();
-        #[allow(clippy::disallowed_types)]
-        let started = Instant::now();
-        for key in batch {
-            table.insert(key);
-            inserts += 1;
+        match insert {
+            Insert::Plain => {
+                #[allow(clippy::disallowed_types)]
+                let started = Instant::now();
+                for key in batch {
+                    table.insert(key);
+                    inserts += 1;
+                }
+                took += started.elapsed();
+            }
+            Insert::Finger => {
+                inserts += batch.len() as u64;
+                #[allow(clippy::disallowed_types)]
+                let started = Instant::now();
+                table.insert_sorted(batch);
+                took += started.elapsed();
+            }
         }
-        took += started.elapsed();
         if table.len() >= entries {
             table = T::default();
         }
@@ -393,9 +505,9 @@ fn span(xs: &[f64]) -> String {
     format!("{lo:.1}-{hi:.1}, spread {:.1}", hi - lo)
 }
 
-/// A memtable filled with the replay's `v6-256` groups up to `entries` entries.
-fn filled<T: Table>(entries: usize) -> T {
-    let mut source = Groups::new(Layout::V6);
+/// A memtable filled with the replay's groups of `layout` up to `entries` entries.
+fn filled<T: Table>(layout: Layout, entries: usize) -> T {
+    let mut source = Groups::new(layout);
     let mut table = T::default();
     while table.len() < entries {
         for key in source.next_group() {
@@ -407,8 +519,8 @@ fn filled<T: Table>(entries: usize) -> T {
 
 /// Seek targets: keys of the groups after the ones that filled the memtable, so some are in it
 /// and some are not, in a random order.
-fn targets(entries: usize) -> Vec<Vec<u8>> {
-    let mut source = Groups::new(Layout::V6);
+fn targets(layout: Layout, entries: usize) -> Vec<Vec<u8>> {
+    let mut source = Groups::new(layout);
     let mut table = OneList::default();
     while table.len() < entries {
         for key in source.next_group() {
@@ -445,106 +557,300 @@ fn time_seek<T: Table>(table: &T, targets: &[Vec<u8>]) -> f64 {
     started.elapsed().as_nanos() as f64 / targets.len() as f64
 }
 
-/// Checks the copied hash on slate-temporal's independent vector (`p`/`ns`/`a`: slot 35,033,
-/// hash `88d9cadafe521592`), and the prototype's order and seek on a small memtable.
-fn check() {
-    assert_eq!(workflow_id_hash("p", "ns", "a"), 0x88d9_cada_fe52_1592);
-    let mut one = OneList::default();
-    let mut by_prefix = ByPrefix::default();
-    let mut source = Groups::new(Layout::V6);
-    for _ in 0..200 {
-        for key in source.next_group() {
-            one.insert(key.clone());
-            by_prefix.insert(key);
+/// The keys of `table` in iteration order.
+fn keys<S: Scheme>(table: &ByPrefix<S>) -> Vec<Vec<u8>> {
+    let mut keys = Vec::new();
+    for at in &table.used {
+        if let Some(list) = &table.lists[*at] {
+            keys.extend(list.iter().map(|entry| entry.key().clone()));
         }
     }
-    for key in [
-        vec![0u8],
-        vec![1, 9],
-        vec![2],
-        vec![2, 0],
-        vec![2, 0, 7],
-        vec![3],
-    ] {
+    keys
+}
+
+/// Checks one scheme against one list on `layout`'s keys and a few short keys: the same keys in
+/// the same order, the same seeks, and the same keys by plain insert and by finger.
+fn check_scheme<S: Scheme>(layout: Layout, short: &[Vec<u8>]) {
+    let mut one = OneList::default();
+    let mut by_prefix = ByPrefix::<S>::default();
+    let mut fingered = ByPrefix::<S>::default();
+    let mut one_fingered = OneList::default();
+    let mut source = Groups::new(layout);
+    for _ in 0..200 {
+        let group = source.next_group();
+        for key in &group {
+            one.insert(key.clone());
+            by_prefix.insert(key.clone());
+        }
+        fingered.insert_sorted(group.clone());
+        one_fingered.insert_sorted(group);
+    }
+    for key in short {
         one.insert(key.clone());
-        by_prefix.insert(key);
+        by_prefix.insert(key.clone());
+        fingered.insert_sorted(vec![key.clone()]);
+        one_fingered.insert_sorted(vec![key.clone()]);
     }
     let a: Vec<Vec<u8>> = one.0.iter().map(|entry| entry.key().clone()).collect();
-    let mut b = Vec::new();
-    for at in &by_prefix.used {
-        if let Some(list) = &by_prefix.lists[*at] {
-            b.extend(list.iter().map(|entry| entry.key().clone()));
-        }
-    }
-    assert_eq!(a, b, "the prototype iterates in key order");
+    let b: Vec<Vec<u8>> = one_fingered
+        .0
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    assert_eq!(a, keys(&by_prefix), "the prototype iterates in key order");
+    assert_eq!(a, keys(&fingered), "the finger inserts the same keys");
+    assert_eq!(a, b, "the finger inserts the same keys in one list");
     assert_eq!(one.len(), by_prefix.len());
-    for target in targets(2_000).iter().take(2_000).chain(&a) {
+    for target in targets(layout, 2_000).iter().take(2_000).chain(&a) {
         assert_eq!(one.seek(target), by_prefix.seek(target));
     }
     assert_eq!(by_prefix.seek(&[4]), None);
 }
 
+/// Checks the copied hash on slate-temporal's independent vector (`p`/`ns`/`a`: slot 35,033,
+/// hash `88d9cadafe521592`), and both schemes.
+fn check() {
+    assert_eq!(workflow_id_hash("p", "ns", "a"), 0x88d9_cada_fe52_1592);
+    let short = [
+        vec![0u8],
+        vec![1],
+        vec![1, 9],
+        vec![2],
+        vec![2, 0],
+        vec![2, 0, 7],
+        vec![3],
+    ];
+    check_scheme::<Bucket>(Layout::V6, &short);
+    check_scheme::<KeySpace>(Layout::V5, &short);
+}
+
+/// A variant of the replay.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    /// v5's keys in one list.
+    V5,
+    /// v6's keys at 256 buckets in one list.
+    V6,
+    /// v6's keys at 256 buckets, one list for each bucket.
+    V6ByBucket,
+    /// v5's keys, one list for each key space.
+    V5ByKeySpace,
+}
+
+impl Variant {
+    const ALL: [Variant; 4] = [
+        Variant::V5,
+        Variant::V6,
+        Variant::V6ByBucket,
+        Variant::V5ByKeySpace,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Variant::V5 => "v5",
+            Variant::V6 => "v6-256",
+            Variant::V6ByBucket => "v6-256-by-bucket",
+            Variant::V5ByKeySpace => "v5-by-key-space",
+        }
+    }
+
+    fn replay(self, insert: Insert, entries: usize, groups: usize) -> f64 {
+        match self {
+            Variant::V5 => replay::<OneList>(Layout::V5, insert, entries, groups),
+            Variant::V6 => replay::<OneList>(Layout::V6, insert, entries, groups),
+            Variant::V6ByBucket => replay::<ByPrefix<Bucket>>(Layout::V6, insert, entries, groups),
+            Variant::V5ByKeySpace => {
+                replay::<ByPrefix<KeySpace>>(Layout::V5, insert, entries, groups)
+            }
+        }
+    }
+}
+
+impl Insert {
+    fn name(self) -> &'static str {
+        match self {
+            Insert::Plain => "plain",
+            Insert::Finger => "finger",
+        }
+    }
+}
+
+/// Times a full iteration and a seek on `layout`'s keys, one list against the prototype, six
+/// times each in alternation. Returns the four series: iteration in one list and in the
+/// prototype, then seek in one list and in the prototype.
+fn iterate_and_seek<S: Scheme>(layout: Layout, entries: usize) -> [Vec<f64>; 4] {
+    let one: OneList = filled(layout, entries);
+    let by_prefix: ByPrefix<S> = filled(layout, entries);
+    let targets = targets(layout, entries);
+    time_iterate(&one);
+    time_iterate(&by_prefix);
+    time_seek(&one, &targets);
+    time_seek(&by_prefix, &targets);
+    let mut series: [Vec<f64>; 4] = Default::default();
+    for _ in 0..REPLAYS {
+        series[0].push(time_iterate(&one));
+        series[1].push(time_iterate(&by_prefix));
+        series[2].push(time_seek(&one, &targets));
+        series[3].push(time_seek(&by_prefix, &targets));
+    }
+    series
+}
+
+/// Runs this bench's executable again with `args`, and returns what it prints.
+fn child(args: &[String]) -> String {
+    let exe = std::env::current_exe().expect("the bench's executable");
+    let out = std::process::Command::new(exe)
+        .args(args)
+        .output()
+        .expect("the child runs");
+    assert!(out.status.success(), "the child {args:?} failed: {out:?}");
+    String::from_utf8(out.stdout).expect("the child prints text")
+}
+
+fn values(text: &str) -> Vec<f64> {
+    text.split_whitespace()
+        .map(|value| value.parse().expect("a number"))
+        .collect()
+}
+
+fn list(xs: &[f64]) -> String {
+    let xs: Vec<String> = xs.iter().map(|x| format!("{x:.1}")).collect();
+    xs.join(" ")
+}
+
+/// The driver. Each replay runs in its own process, after its own warm-up, so that no variant
+/// runs on the heap that another variant left. The eight variants alternate in each of six
+/// rounds. Each iteration and seek reading runs in its own process for each layout and size.
+#[allow(clippy::disallowed_macros)]
+fn drive() {
+    check();
+    let runs: Vec<(Variant, Insert)> = [Insert::Plain, Insert::Finger]
+        .into_iter()
+        .flat_map(|insert| Variant::ALL.map(|variant| (variant, insert)))
+        .collect();
+    for entries in ENTRIES {
+        let mut readings: Vec<Vec<f64>> = vec![Vec::new(); runs.len()];
+        for _ in 0..REPLAYS {
+            for (at, (variant, insert)) in runs.iter().enumerate() {
+                let args = [
+                    "replay".to_string(),
+                    variant.name().to_string(),
+                    insert.name().to_string(),
+                    entries.to_string(),
+                ];
+                readings[at].extend(values(&child(&args)));
+            }
+        }
+        for insert in [Insert::Plain, Insert::Finger] {
+            let of = |variant: Variant| {
+                let at = runs
+                    .iter()
+                    .position(|run| *run == (variant, insert))
+                    .expect("a run of each variant");
+                &readings[at]
+            };
+            let base = mean(of(Variant::V5));
+            for variant in Variant::ALL {
+                let xs = of(variant);
+                println!(
+                    "memtable of {entries} entries, {} insert, {}: ns per insert {:.1} ({}) \
+                     ({:+.1}); replays {}",
+                    insert.name(),
+                    variant.name(),
+                    mean(xs),
+                    span(xs),
+                    mean(xs) - base,
+                    list(xs)
+                );
+            }
+            let v6_excess = mean(of(Variant::V6)) - base;
+            let bucket_excess = mean(of(Variant::V6ByBucket)) - base;
+            println!(
+                "memtable of {entries} entries, {} insert: share of v6-256's excess removed by \
+                 bucket {:.2}; valid (excess at 256 >= 10 ns): {}",
+                insert.name(),
+                1.0 - bucket_excess / v6_excess,
+                v6_excess >= 10.0
+            );
+        }
+    }
+    for layout in ["v6", "v5"] {
+        for entries in ENTRIES {
+            let args = [
+                "iterate".to_string(),
+                layout.to_string(),
+                entries.to_string(),
+            ];
+            let text = child(&args);
+            let series: Vec<Vec<f64>> = text.lines().map(values).collect();
+            let change = |a: &[f64], b: &[f64]| 100.0 * (mean(b) / mean(a) - 1.0);
+            println!(
+                "{} keys, memtable of {entries} entries: full iteration ns per entry one list \
+                 {:.2} ({}), prototype {:.2} ({}) ({:+.1}%); seek ns one list {:.1} ({}), \
+                 prototype {:.1} ({}) ({:+.1}%)",
+                match layout {
+                    "v6" => "v6-256, by bucket",
+                    _ => "v5, by key space",
+                },
+                mean(&series[0]),
+                span(&series[0]),
+                mean(&series[1]),
+                span(&series[1]),
+                change(&series[0], &series[1]),
+                mean(&series[2]),
+                span(&series[2]),
+                mean(&series[3]),
+                span(&series[3]),
+                change(&series[2], &series[3]),
+            );
+        }
+    }
+}
+
 // The bench prints its figures; it has no logger.
 #[allow(clippy::disallowed_macros)]
 fn main() {
-    check();
-    for entries in ENTRIES {
-        replay::<OneList>(Layout::V5, entries, WARM_UP_GROUPS);
-        replay::<OneList>(Layout::V6, entries, WARM_UP_GROUPS);
-        replay::<ByPrefix>(Layout::V6, entries, WARM_UP_GROUPS);
-        let (mut v5, mut v6, mut proto) = (Vec::new(), Vec::new(), Vec::new());
-        for _ in 0..REPLAYS {
-            v5.push(replay::<OneList>(Layout::V5, entries, GROUPS));
-            v6.push(replay::<OneList>(Layout::V6, entries, GROUPS));
-            proto.push(replay::<ByPrefix>(Layout::V6, entries, GROUPS));
+    // `cargo bench` passes `--bench`.
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|arg| arg != "--bench")
+        .collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    match args.as_slice() {
+        [] => drive(),
+        ["replay", variant, insert, entries] => {
+            let variant = Variant::ALL
+                .into_iter()
+                .find(|v| v.name() == *variant)
+                .expect("a variant");
+            let insert = match *insert {
+                "plain" => Insert::Plain,
+                "finger" => Insert::Finger,
+                other => panic!("no insert path {other}"),
+            };
+            let entries: usize = entries.parse().expect("a number of entries");
+            variant.replay(insert, entries, WARM_UP_GROUPS);
+            println!("{}", variant.replay(insert, entries, GROUPS));
         }
-        let base = mean(&v5);
-        let (v6_excess, proto_excess) = (mean(&v6) - base, mean(&proto) - base);
-        println!(
-            "S2 ids, memtable of {entries} entries: ns per insert v5 {base:.1} ({}), \
-             v6-256 {:.1} ({}) ({v6_excess:+.1}), v6-256 by prefix {:.1} ({}) \
-             ({proto_excess:+.1}); share of the excess removed: {:.2}; \
-             valid (excess at 256 >= 10 ns): {}",
-            span(&v5),
-            mean(&v6),
-            span(&v6),
-            mean(&proto),
-            span(&proto),
-            1.0 - proto_excess / v6_excess,
-            v6_excess >= 10.0
-        );
-    }
-    for entries in ENTRIES {
-        let one: OneList = filled(entries);
-        let by_prefix: ByPrefix = filled(entries);
-        let targets = targets(entries);
-        time_iterate(&one);
-        time_iterate(&by_prefix);
-        time_seek(&one, &targets);
-        time_seek(&by_prefix, &targets);
-        let (mut iter_one, mut iter_proto, mut seek_one, mut seek_proto) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for _ in 0..REPLAYS {
-            iter_one.push(time_iterate(&one));
-            iter_proto.push(time_iterate(&by_prefix));
-            seek_one.push(time_seek(&one, &targets));
-            seek_proto.push(time_seek(&by_prefix, &targets));
+        ["iterate", layout, entries] => {
+            let entries: usize = entries.parse().expect("a number of entries");
+            let series = match *layout {
+                "v6" => iterate_and_seek::<Bucket>(Layout::V6, entries),
+                "v5" => iterate_and_seek::<KeySpace>(Layout::V5, entries),
+                other => panic!("no layout {other}"),
+            };
+            for xs in series {
+                println!("{}", list_exact(&xs));
+            }
         }
-        println!(
-            "v6-256 keys, memtable of {} entries: full iteration ns per entry one list {:.2} ({}), \
-             by prefix {:.2} ({}) ({:+.1}%); seek ns one list {:.1} ({}), by prefix {:.1} ({}) \
-             ({:+.1}%)",
-            one.len(),
-            mean(&iter_one),
-            span(&iter_one),
-            mean(&iter_proto),
-            span(&iter_proto),
-            100.0 * (mean(&iter_proto) / mean(&iter_one) - 1.0),
-            mean(&seek_one),
-            span(&seek_one),
-            mean(&seek_proto),
-            span(&seek_proto),
-            100.0 * (mean(&seek_proto) / mean(&seek_one) - 1.0),
-        );
+        other => panic!(
+            "usage: [replay <variant> <insert> <entries> | iterate <v5|v6> <entries>]: {other:?}"
+        ),
     }
+}
+
+/// `xs` with every digit, for the driver to read back.
+fn list_exact(xs: &[f64]) -> String {
+    let xs: Vec<String> = xs.iter().map(|x| x.to_string()).collect();
+    xs.join(" ")
 }
